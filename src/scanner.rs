@@ -1,5 +1,5 @@
 use crate::domain::Entry;
-use std::fs::{self, Metadata};
+use std::fs::{self};
 use std::path::{Path, PathBuf};
 
 fn is_hidden(p: &Path) -> bool {
@@ -9,11 +9,7 @@ fn is_hidden(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_symlink(md: &Metadata) -> bool {
-    md.file_type().is_symlink()
-}
-
-fn is_project_root(p: &Path) -> bool {
+pub fn is_project_root(p: &Path) -> bool {
     for marker in &[
         ".git",
         "Cargo.toml",
@@ -21,7 +17,10 @@ fn is_project_root(p: &Path) -> bool {
         "pyproject.toml",
         "pubspec.yaml",
     ] {
-        if p.join(marker).exists() {
+        // symlink_metadata (not exists()/Path::exists, which follow links and
+        // report false for a broken symlink) so a dangling marker symlink
+        // still counts as present rather than silently weakening protection.
+        if fs::symlink_metadata(p.join(marker)).is_ok() {
             return true;
         }
     }
@@ -34,13 +33,14 @@ pub fn scan_entries(dir: &Path) -> Vec<Entry> {
     if let Ok(walker) = walker {
         for item in walker.flatten() {
             let path = item.path();
-            let md = match item.metadata() {
+            // No-follow symlink metadata
+            let mds = match fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            let is_dir = md.is_dir();
-            let is_symlink = is_symlink(&md);
-
+            let is_symlink = mds.file_type().is_symlink();
+            let is_dir = mds.is_dir();
+            let hidden = is_hidden(&path);
             let mut project_root = false;
             let mut protected = false;
             if is_dir {
@@ -51,12 +51,13 @@ pub fn scan_entries(dir: &Path) -> Vec<Entry> {
                 path: path.clone(),
                 is_dir,
                 is_symlink,
+                hidden,
                 size: if is_dir || is_symlink {
                     None
                 } else {
-                    Some(md.len())
+                    Some(mds.len())
                 },
-                mtime: md.modified().ok().and_then(|t| {
+                mtime: mds.modified().ok().and_then(|t| {
                     t.duration_since(std::time::UNIX_EPOCH)
                         .ok()
                         .map(|d| d.as_secs())
@@ -89,8 +90,9 @@ pub struct DoctorFinding {
     pub reason: String,
 }
 
-pub fn cmd_doctor(path: String, json: bool) {
-    let entries = scan_entries(Path::new(&path));
+/// doctor_findings collects findings by filename/stat only. No content read. Pure; does not print or mutate FS.
+pub fn doctor_findings(path: &std::path::Path) -> Vec<DoctorFinding> {
+    let entries = scan_entries(path);
     let mut findings: Vec<DoctorFinding> = Vec::new();
     for e in &entries {
         if e.project_root {
@@ -111,18 +113,14 @@ pub fn cmd_doctor(path: String, json: bool) {
                 reason: "Symlink (not mutated)".into(),
             });
         }
-        if is_hidden(&e.path) {
+        if e.hidden {
             findings.push(DoctorFinding {
                 path: e.path.clone(),
                 reason: "Hidden file (not mutated)".into(),
             });
         }
         let fname = e.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let lower = fname.to_ascii_lowercase();
-        if ["token", "secret", "password", "key", "env", "credential"]
-            .iter()
-            .any(|frag| lower.contains(frag))
-        {
+        if crate::utils::is_sensitive_filename(fname) {
             findings.push(DoctorFinding {
                 path: e.path.clone(),
                 reason: "Suspicious filename (token-like)".into(),
@@ -142,8 +140,8 @@ pub fn cmd_doctor(path: String, json: bool) {
                 if let Some(mtime) = e.mtime {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
                     if now > mtime + 365 * 24 * 3600 {
                         findings.push(DoctorFinding {
                             path: e.path.clone(),
@@ -153,7 +151,6 @@ pub fn cmd_doctor(path: String, json: bool) {
                 }
             }
         }
-        // Build output dirs
         if e.is_dir {
             let fname = e.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if ["node_modules", "target", ".venv"].contains(&fname) {
@@ -164,6 +161,11 @@ pub fn cmd_doctor(path: String, json: bool) {
             }
         }
     }
+    findings
+}
+
+pub fn cmd_doctor(path: String, json: bool) {
+    let findings = doctor_findings(Path::new(&path));
     if json {
         println!("{}", serde_json::to_string_pretty(&findings).unwrap());
     } else {

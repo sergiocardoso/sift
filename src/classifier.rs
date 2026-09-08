@@ -1,7 +1,6 @@
 use crate::domain::{Category, Entry};
 use std::collections::HashMap;
 
-#[derive(Default)]
 pub struct CategoryDB {
     map: HashMap<&'static str, Category>,
 }
@@ -31,10 +30,17 @@ impl CategoryDB {
         for ext in ["tmp", "swp", "swo"] {
             map.insert(ext, Junk);
         }
-        map.insert("log", Junk);
-        map.insert("bak", Junk);
         Self { map }
     }
+}
+
+impl Default for CategoryDB {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CategoryDB {
     pub fn classify(&self, entry: &mut Entry) {
         if entry.is_symlink || entry.is_dir || entry.protected {
             entry.classified_as = Some(Category::Unknown);

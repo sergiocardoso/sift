@@ -1,205 +1,306 @@
 use crate::classifier::CategoryDB;
-use crate::config::{load_config, Rule};
-use crate::domain::{Action, Category, Op, Plan};
-use crate::scanner::scan_entries;
-use std::path::Path;
+use crate::config::{
+    load_config, rules_by_priority, safe_join_under, validate_rule_destination, Rule,
+};
+use crate::domain::{Action, Category, Entry, Op, Plan};
+use crate::scanner::{is_project_root, scan_entries};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+/// Result of classifying a single entry for `organize`, before collision
+/// checking against the real filesystem.
+enum Decision {
+    Skip(String),
+    Trash(String),
+    Move { dest_dir: PathBuf, reason: String },
+}
+
+enum DirStatus {
+    Exists,
+    Missing,
+    Blocked,
+}
+
+fn dir_status(dir: &Path) -> DirStatus {
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.is_dir() => DirStatus::Exists,
+        Ok(_) => DirStatus::Blocked,
+        Err(_) => DirStatus::Missing,
+    }
+}
+
+/// Built-in destination directory name and human-readable reason for a
+/// classified category. Categories with no built-in organize destination
+/// (Unknown, Junk, BuildOutput, Sensitive) return `None`.
+fn builtin_destination(cat: Category) -> Option<(&'static str, &'static str)> {
+    match cat {
+        Category::Document => Some(("Documents", "Document")),
+        Category::Image => Some(("Images", "Image")),
+        Category::Video => Some(("Video", "Video")),
+        Category::Audio => Some(("Audio", "Audio")),
+        Category::Archive => Some(("Archives", "Archive")),
+        Category::ThreeD => Some(("3D", "3D asset")),
+        Category::Junk | Category::BuildOutput | Category::Sensitive | Category::Unknown => None,
+    }
+}
+
+fn is_builtin_junk(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ["tmp", "swp", "swo"].contains(&ext))
+        .unwrap_or(false)
+}
+
+fn glob_match(pattern: &str, path: &Path) -> bool {
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if pattern.contains('*') {
+        let needle = pattern.replace('*', "");
+        fname.contains(&needle)
+    } else {
+        fname == pattern
+    }
+}
+
+fn skip_all(entries: &[Entry], reason: &str) -> Plan {
+    Plan {
+        actions: entries
+            .iter()
+            .map(|e| Action {
+                src: e.path.clone(),
+                dst: None,
+                op: Op::Skip,
+                reason: Some(reason.to_string()),
+                undoable: false,
+            })
+            .collect(),
+    }
+}
+
+fn classify_for_organize(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    builtin: &CategoryDB,
+) -> Decision {
+    if entry.is_dir || entry.is_symlink || entry.protected || entry.hidden {
+        return Decision::Skip("Directory/symlink/protected/hidden".into());
+    }
+    for rule in rules {
+        if !glob_match(&rule.pattern, &entry.path) {
+            continue;
+        }
+        let reason = rule
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Config rule: {}", rule.name));
+        return match rule.action.as_str() {
+            "Skip" => Decision::Skip(reason),
+            "Trash" => Decision::Trash(reason),
+            "Move" => {
+                let dest = match rule.destination.as_deref() {
+                    Some(d) => d,
+                    None => return Decision::Skip("Move rule missing destination".into()),
+                };
+                if !validate_rule_destination(dest) {
+                    return Decision::Skip("Unsafe config destination rejected".into());
+                }
+                match safe_join_under(target, Path::new(dest)) {
+                    Some(dest_dir) => Decision::Move { dest_dir, reason },
+                    None => Decision::Skip("Unsafe config destination rejected".into()),
+                }
+            }
+            _ => Decision::Skip("Invalid rule config".into()),
+        };
+    }
+    let mut classified = entry.clone();
+    builtin.classify(&mut classified);
+    match classified.classified_as {
+        Some(Category::Junk) => Decision::Trash("Built-in junk file".into()),
+        Some(cat) => match builtin_destination(cat) {
+            Some((name, reason)) => Decision::Move {
+                dest_dir: target.join(name),
+                reason: reason.into(),
+            },
+            None => Decision::Skip("Unclassified/unknown".into()),
+        },
+        None => Decision::Skip("Unclassified/unknown".into()),
+    }
+}
+
+/// Resolves one entry's final action, checking real filesystem collisions
+/// and recording any directory that still needs `Op::CreateDir`.
+fn resolve_organize_action(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    builtin: &CategoryDB,
+    needed_dirs: &mut BTreeSet<PathBuf>,
+) -> Action {
+    let skip = |reason: &str| Action {
+        src: entry.path.clone(),
+        dst: None,
+        op: Op::Skip,
+        reason: Some(reason.to_string()),
+        undoable: false,
+    };
+    // Collision skips keep the intended destination visible in the plan so
+    // the user can see what blocked the move, even though it never happens.
+    let skip_with_intended_dst = |dest: PathBuf, reason: &str| Action {
+        src: entry.path.clone(),
+        dst: Some(dest),
+        op: Op::Skip,
+        reason: Some(reason.to_string()),
+        undoable: false,
+    };
+    match classify_for_organize(entry, target, rules, builtin) {
+        Decision::Skip(reason) => Action {
+            src: entry.path.clone(),
+            dst: None,
+            op: Op::Skip,
+            reason: Some(reason),
+            undoable: false,
+        },
+        Decision::Trash(reason) => Action {
+            src: entry.path.clone(),
+            dst: None,
+            op: Op::Trash,
+            reason: Some(reason),
+            undoable: false,
+        },
+        Decision::Move { dest_dir, reason } => match dir_status(&dest_dir) {
+            DirStatus::Blocked => {
+                skip_with_intended_dst(dest_dir, "Destination directory occupied by non-directory")
+            }
+            status => {
+                let Some(filename) = entry.path.file_name() else {
+                    return skip("Entry has no file name");
+                };
+                let dest = dest_dir.join(filename);
+                if std::fs::symlink_metadata(&dest).is_ok() {
+                    skip_with_intended_dst(dest, "Destination exists (collision)")
+                } else {
+                    if matches!(status, DirStatus::Missing) {
+                        needed_dirs.insert(dest_dir.clone());
+                    }
+                    Action {
+                        src: entry.path.clone(),
+                        dst: Some(dest),
+                        op: Op::Move,
+                        reason: Some(reason),
+                        undoable: true,
+                    }
+                }
+            }
+        },
+    }
+}
 
 pub fn plan_organize(path: &str, config_rules: &[Rule], builtin: &CategoryDB) -> Plan {
     let target = Path::new(path);
-    let mut entries = scan_entries(target);
-    let mut actions = vec![];
-    for entry in entries.iter_mut() {
-        // Built-in: skip directory, symlink, protected, unknown
-        if entry.is_dir || entry.is_symlink || entry.protected {
-            actions.push(Action {
-                src: entry.path.clone(),
-                dst: None,
-                op: Op::Skip,
-                reason: Some("Directory/symlink/protected".into()),
-                undoable: false,
-            });
-            continue;
-        }
-        // Config exact rule takes priority
-        let mut applied_rule = None;
-        for rule in config_rules.iter().filter(|r| r.enabled) {
-            if glob_match(&rule.pattern, &entry.path) {
-                match rule.action.as_str() {
-                    "Skip" => actions.push(Action {
-                        src: entry.path.clone(),
-                        dst: None,
-                        op: Op::Skip,
-                        reason: rule.description.clone(),
-                        undoable: false,
-                    }),
-                    "Trash" => actions.push(Action {
-                        src: entry.path.clone(),
-                        dst: None,
-                        op: Op::Trash,
-                        reason: rule.description.clone(),
-                        undoable: false,
-                    }),
-                    "Move" if rule.destination.is_some() => actions.push(Action {
-                        src: entry.path.clone(),
-                        dst: Some(target.join(rule.destination.as_ref().unwrap())),
-                        op: Op::Move,
-                        reason: rule.description.clone(),
-                        undoable: true,
-                    }),
-                    _ => actions.push(Action {
-                        src: entry.path.clone(),
-                        dst: None,
-                        op: Op::Skip,
-                        reason: Some("Invalid rule config".into()),
-                        undoable: false,
-                    }),
-                }
-                applied_rule = Some(1);
-                break;
-            }
-        }
-        if applied_rule.is_some() {
-            continue;
-        }
-        // Built-in classifier
-        builtin.classify(entry);
-        match entry.classified_as {
-            Some(Category::Unknown) | None => actions.push(Action {
-                src: entry.path.clone(),
-                dst: None,
-                op: Op::Skip,
-                reason: Some("Unclassified/unknown".into()),
-                undoable: false,
-            }),
-            Some(Category::Junk) => actions.push(Action {
-                src: entry.path.clone(),
-                dst: None,
-                op: Op::Trash,
-                reason: Some("Built-in junk file".into()),
-                undoable: false,
-            }),
-            Some(Category::ThreeD) => actions.push(Action {
-                src: entry.path.clone(),
-                dst: Some(target.join("3D")),
-                op: Op::Move,
-                reason: Some("3D asset".into()),
-                undoable: true,
-            }),
-            Some(Category::Archive) => actions.push(Action {
-                src: entry.path.clone(),
-                dst: Some(target.join("Archives")),
-                op: Op::Move,
-                reason: Some("Archive".into()),
-                undoable: true,
-            }),
-            Some(Category::Document) => actions.push(Action {
-                src: entry.path.clone(),
-                dst: Some(target.join("Documents")),
-                op: Op::Move,
-                reason: Some("Document".into()),
-                undoable: true,
-            }),
-            Some(Category::Image) => actions.push(Action {
-                src: entry.path.clone(),
-                dst: Some(target.join("Images")),
-                op: Op::Move,
-                reason: Some("Image".into()),
-                undoable: true,
-            }),
-            Some(Category::Video) => actions.push(Action {
-                src: entry.path.clone(),
-                dst: Some(target.join("Video")),
-                op: Op::Move,
-                reason: Some("Video".into()),
-                undoable: true,
-            }),
-            Some(Category::Audio) => actions.push(Action {
-                src: entry.path.clone(),
-                dst: Some(target.join("Audio")),
-                op: Op::Move,
-                reason: Some("Audio".into()),
-                undoable: true,
-            }),
-            _ => actions.push(Action {
-                src: entry.path.clone(),
-                dst: None,
-                op: Op::Skip,
-                reason: Some("Uncategorized".into()),
-                undoable: false,
-            }),
-        }
+    let entries = scan_entries(target);
+    if is_project_root(target) {
+        return skip_all(&entries, "Target is project root");
     }
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let entry_actions: Vec<Action> = entries
+        .iter()
+        .map(|entry| resolve_organize_action(entry, target, &rules, builtin, &mut needed_dirs))
+        .collect();
+    let mut actions: Vec<Action> = needed_dirs
+        .into_iter()
+        .map(|dir| Action {
+            src: dir,
+            dst: None,
+            op: Op::CreateDir,
+            reason: Some("Ensure directory exists".into()),
+            undoable: false,
+        })
+        .collect();
+    actions.extend(entry_actions);
     Plan { actions }
 }
 
-pub fn plan_clean(path: &str, config_rules: &[Rule], builtin: &CategoryDB) -> Plan {
-    let target = Path::new(path);
-    let mut entries = scan_entries(target);
-    let mut actions = vec![];
-    for entry in entries.iter_mut() {
-        if entry.is_dir || entry.is_symlink || entry.protected {
-            actions.push(Action {
-                src: entry.path.clone(),
-                dst: None,
-                op: Op::Skip,
-                reason: Some("Directory/symlink/protected".into()),
-                undoable: false,
-            });
+fn resolve_clean_action(entry: &Entry, rules: &[&Rule]) -> Action {
+    if entry.is_dir || entry.is_symlink || entry.protected || entry.hidden {
+        return Action {
+            src: entry.path.clone(),
+            dst: None,
+            op: Op::Skip,
+            reason: Some("Directory/symlink/protected/hidden".into()),
+            undoable: false,
+        };
+    }
+    for rule in rules {
+        if !glob_match(&rule.pattern, &entry.path) {
             continue;
         }
-        // Config Trash rule strictly only
-        let mut applied = false;
-        for rule in config_rules
-            .iter()
-            .filter(|r| r.enabled && r.action.as_str() == "Trash")
-        {
-            if glob_match(&rule.pattern, &entry.path) {
-                actions.push(Action {
-                    src: entry.path.clone(),
-                    dst: None,
-                    op: Op::Trash,
-                    reason: rule.description.clone(),
-                    undoable: false,
-                });
-                applied = true;
-                break;
-            }
-        }
-        if applied {
-            continue;
-        }
-        // Built-in junk
-        builtin.classify(entry);
-        if matches!(entry.classified_as, Some(Category::Junk)) {
-            actions.push(Action {
+        let reason = rule
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Config rule: {}", rule.name));
+        return match rule.action.as_str() {
+            "Trash" => Action {
                 src: entry.path.clone(),
                 dst: None,
                 op: Op::Trash,
-                reason: Some("Built-in junk file".into()),
+                reason: Some(reason),
                 undoable: false,
-            });
-        } else {
-            actions.push(Action {
+            },
+            "Skip" => Action {
                 src: entry.path.clone(),
                 dst: None,
                 op: Op::Skip,
-                reason: Some("Not trash candidate".into()),
+                reason: Some(reason),
                 undoable: false,
-            });
-        }
+            },
+            "Move" => Action {
+                src: entry.path.clone(),
+                dst: None,
+                op: Op::Skip,
+                reason: Some("Config rule specifies Move (not applicable to clean)".into()),
+                undoable: false,
+            },
+            _ => Action {
+                src: entry.path.clone(),
+                dst: None,
+                op: Op::Skip,
+                reason: Some("Invalid rule config".into()),
+                undoable: false,
+            },
+        };
     }
-    Plan { actions }
-}
-
-fn glob_match(pattern: &str, path: &std::path::Path) -> bool {
-    if pattern.contains('*') {
-        // crude: only *.ext or *foo*
-        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let pattern_ = pattern.replace("*", "");
-        fname.contains(&pattern_)
+    if is_builtin_junk(&entry.path) {
+        Action {
+            src: entry.path.clone(),
+            dst: None,
+            op: Op::Trash,
+            reason: Some("Built-in junk file".into()),
+            undoable: false,
+        }
     } else {
-        path.file_name().and_then(|s| s.to_str()) == Some(pattern)
+        Action {
+            src: entry.path.clone(),
+            dst: None,
+            op: Op::Skip,
+            reason: Some("Not trash candidate".into()),
+            undoable: false,
+        }
     }
+}
+
+pub fn plan_clean(path: &str, config_rules: &[Rule], _builtin: &CategoryDB) -> Plan {
+    let target = Path::new(path);
+    let entries = scan_entries(target);
+    if is_project_root(target) {
+        return skip_all(&entries, "Target is project root");
+    }
+    let rules = rules_by_priority(config_rules);
+    let actions = entries
+        .iter()
+        .map(|entry| resolve_clean_action(entry, &rules))
+        .collect();
+    Plan { actions }
 }
 
 pub fn cmd_organize(path: String, apply: bool, json: bool) {
@@ -207,7 +308,7 @@ pub fn cmd_organize(path: String, apply: bool, json: bool) {
     let config = cfg_path
         .and_then(|p| load_config(&p).ok())
         .unwrap_or_default();
-    let builtins = CategoryDB::new();
+    let builtins = CategoryDB::default();
     let plan = plan_organize(&path, &config.rules, &builtins);
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap());
@@ -239,7 +340,7 @@ pub fn cmd_clean(path: String, apply: bool, json: bool) {
     let config = cfg_path
         .and_then(|p| load_config(&p).ok())
         .unwrap_or_default();
-    let builtins = CategoryDB::new();
+    let builtins = CategoryDB::default();
     let plan = plan_clean(&path, &config.rules, &builtins);
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap());

@@ -1,5 +1,5 @@
 use crate::domain::{ActionResult, HistoryItem, Op, Plan};
-use crate::fs::{safe_rename, send_to_trash};
+use crate::fs::{safe_create_dir, safe_rename, send_to_trash};
 use crate::history::{new_history_id, record_history};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,6 +7,10 @@ pub fn execute_plan(plan: Plan, _workdir: &str) {
     let mut results = vec![];
     for action in &plan.actions {
         let op_result = match action.op {
+            Op::CreateDir => match safe_create_dir(&action.src) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(format!("CreateDir failed: {}", e)),
+            },
             Op::Move => {
                 if let Some(ref dst) = action.dst {
                     match safe_rename(&action.src, dst) {
@@ -33,13 +37,15 @@ pub fn execute_plan(plan: Plan, _workdir: &str) {
     }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let hist = HistoryItem {
         id: new_history_id(),
         actions: plan.actions,
         timestamp: ts,
         outcomes: results,
     };
-    record_history(&hist);
+    if let Err(e) = record_history(&hist) {
+        eprintln!("history: failed to record execution: {}", e);
+    }
 }

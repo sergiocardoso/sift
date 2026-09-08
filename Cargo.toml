@@ -2,21 +2,18 @@
 name = "sift"
 version = "0.1.0"
 edition = "2021"
-authors = ["Sérgio Cardoso <sergio@flokin.com>"]
+authors = ["Sérgio Cardoso"]
 description = "Local-first, safe CLI for cleaning and organizing files."
 license = "MIT"
-repository = "https://github.com/flokin/sift"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-walkdir = "2.5"
 trash = "5.2"
 directories = "5.0"
 thiserror = "1.0"
-chrono = { version = "0.4.45", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3.0"

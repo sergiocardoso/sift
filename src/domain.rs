@@ -6,6 +6,7 @@ pub struct Entry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub is_symlink: bool,
+    pub hidden: bool,
     pub size: Option<u64>,
     pub mtime: Option<u64>,
     pub project_root: bool,
@@ -13,7 +14,7 @@ pub struct Entry {
     pub classified_as: Option<Category>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Category {
     Document,
     Image,
@@ -43,6 +44,7 @@ pub struct Action {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
+    CreateDir,
     Move,
     Trash,
     Skip,

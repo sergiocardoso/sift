@@ -4,17 +4,22 @@ use clap::{Parser, Subcommand};
 #[command(name = "sift", about = "Local-first safe file organizer/cleaner.")]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
+    /// Path to inspect when no subcommand is given; runs an organize dry-run.
+    #[arg(default_value = ".")]
+    pub path: String,
 }
 
 #[derive(Subcommand)]
 pub enum Commands {
     Scan {
+        #[arg(default_value = ".")]
         path: String,
         #[arg(long)]
         json: bool,
     },
     Organize {
+        #[arg(default_value = ".")]
         path: String,
         #[arg(long)]
         apply: bool,
@@ -22,6 +27,7 @@ pub enum Commands {
         json: bool,
     },
     Clean {
+        #[arg(default_value = ".")]
         path: String,
         #[arg(long)]
         apply: bool,
@@ -29,6 +35,7 @@ pub enum Commands {
         json: bool,
     },
     Doctor {
+        #[arg(default_value = ".")]
         path: String,
         #[arg(long)]
         json: bool,
@@ -38,6 +45,7 @@ pub enum Commands {
         id: String,
     },
     Init {
+        #[arg(default_value = ".")]
         path: String,
         #[arg(long)]
         force: bool,
@@ -50,7 +58,12 @@ pub fn run() {
 }
 
 pub fn dispatch(cli: Cli) {
-    match cli.command {
+    let Some(command) = cli.command else {
+        // Bare `sift [path]`: safe dry-run preview, never mutates.
+        crate::planner::cmd_organize(cli.path, false, false);
+        return;
+    };
+    match command {
         Commands::Scan { path, json } => {
             crate::scanner::cmd_scan(path, json);
         }
