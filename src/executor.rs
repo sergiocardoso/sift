@@ -1,9 +1,23 @@
 use crate::domain::{ActionResult, HistoryItem, Op, Plan};
 use crate::fs::{safe_create_dir, safe_rename, send_to_trash};
 use crate::history::{new_history_id, record_history};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn execute_plan(plan: Plan, _workdir: &str) {
+/// Executes the plan and returns the history record id together with the
+/// actual per-action outcomes, so callers can report what really happened
+/// (and point at `sift history`/`sift undo`) rather than assuming success.
+/// `kind` ("organize", "clean", ...) is stored on the history record purely
+/// for display in `sift history`; it has no effect on execution.
+/// `watch_root`: `None` for a manually (CLI) invoked plan; `Some(root)` for
+/// a plan the watch daemon executed automatically for that watch root —
+/// recorded as `origin`/`watch_root` on the history item, display-only.
+pub fn execute_plan(
+    plan: Plan,
+    _workdir: &str,
+    kind: &str,
+    watch_root: Option<&Path>,
+) -> (String, Vec<ActionResult>) {
     let mut results = vec![];
     for action in &plan.actions {
         let op_result = match action.op {
@@ -39,13 +53,23 @@ pub fn execute_plan(plan: Plan, _workdir: &str) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let id = new_history_id();
     let hist = HistoryItem {
-        id: new_history_id(),
+        id: id.clone(),
         actions: plan.actions,
         timestamp: ts,
-        outcomes: results,
+        outcomes: results.clone(),
+        kind: kind.to_string(),
+        origin: if watch_root.is_some() {
+            "watch"
+        } else {
+            "manual"
+        }
+        .to_string(),
+        watch_root: watch_root.map(|p| p.to_path_buf()),
     };
     if let Err(e) = record_history(&hist) {
         eprintln!("history: failed to record execution: {}", e);
     }
+    (id, results)
 }

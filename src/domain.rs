@@ -22,6 +22,14 @@ pub enum Category {
     Audio,
     Archive,
     ThreeD,
+    /// Source code and scripts (js, py, rs, sh, ...).
+    Code,
+    /// Structured/tabular data (json, csv, yaml, sql, ...).
+    Data,
+    /// An ordinary regular file with no more specific category: the
+    /// conservative fallback destination, distinct from `Unknown` (which
+    /// means "not an ordinary classifiable file at all", e.g. a directory).
+    Other,
     Junk,
     BuildOutput,
     Sensitive,
@@ -56,6 +64,20 @@ pub struct HistoryItem {
     pub actions: Vec<Action>,
     pub timestamp: u64,
     pub outcomes: Vec<ActionResult>,
+    /// What kind of operation this was ("organize", "clean", "undo"), for
+    /// display purposes only. Empty/absent for records written before this
+    /// field existed; `#[serde(default)]` keeps old history files loadable.
+    #[serde(default)]
+    pub kind: String,
+    /// Who initiated this operation: "manual" (CLI-invoked, the default)
+    /// or "watch" (automatic, from a running watch). Empty for records
+    /// written before this field existed; treat empty the same as
+    /// "manual". Display-only, like `kind`.
+    #[serde(default)]
+    pub origin: String,
+    /// The watch root responsible, set only when `origin == "watch"`.
+    #[serde(default)]
+    pub watch_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,5 +6,7 @@ pub mod executor;
 pub mod fs;
 pub mod history;
 pub mod planner;
+pub mod render;
 pub mod scanner;
 pub mod utils;
+pub mod watch;

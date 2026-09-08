@@ -28,10 +28,7 @@ pub fn cmd_history() {
             }
         }
     }
-    items.sort_by_key(|h| h.timestamp);
-    for h in items {
-        println!("{} {} actions {}", h.id, h.timestamp, h.actions.len());
-    }
+    crate::render::history(&items);
 }
 
 /// Attempts to reverse one successful, undoable Move outcome. Never
@@ -92,59 +89,70 @@ fn undo_one(action: &Action, outcome_was_ok: bool) -> Option<ActionResult> {
 
 /// Undoes the moves recorded in history item `id`. The original history
 /// record is left untouched; a separate undo record is written describing
-/// what the undo attempt actually did.
-pub fn cmd_undo(id: String) {
+/// what the undo attempt actually did. Returns `true` iff nothing was
+/// refused (used as the process exit code signal).
+pub fn cmd_undo(id: String) -> bool {
     let hist_dir = get_history_dir();
     let fp = hist_dir.join(format!("{}.json", id));
     let data = match fs::read_to_string(&fp) {
         Ok(s) => s,
         Err(_) => {
-            println!("record not found");
-            return;
+            crate::render::undo_not_found(&id);
+            return false;
         }
     };
     let hist: HistoryItem = match serde_json::from_str(&data) {
         Ok(h) => h,
         Err(_) => {
-            println!("history parse error");
-            return;
+            crate::render::undo_parse_error(&id);
+            return false;
         }
     };
     let mut undo_outcomes: Vec<ActionResult> = Vec::new();
+    let mut trash_skipped = 0usize;
     for (act, outcome) in hist.actions.iter().zip(hist.outcomes.iter()) {
         if act.op == Op::Trash {
-            println!("Undo for trash not supported: {}", act.src.display());
+            trash_skipped += 1;
             continue;
         }
         if let Some(result) = undo_one(act, outcome.result.is_ok()) {
-            if let Err(ref e) = result.result {
-                println!("{}", e);
-            }
             undo_outcomes.push(result);
         }
     }
-    if undo_outcomes.is_empty() {
-        return;
-    }
-    let undo_actions = undo_outcomes
+    let restored = undo_outcomes.iter().filter(|o| o.result.is_ok()).count();
+    let refused: Vec<ActionResult> = undo_outcomes
         .iter()
-        .map(|o| Action {
-            src: o.src.clone(),
-            dst: o.dst.clone(),
-            op: o.op.clone(),
-            reason: Some(format!("Undo of {}", hist.id)),
-            undoable: false,
-        })
+        .filter(|o| o.result.is_err())
+        .cloned()
         .collect();
-    let undo_item = HistoryItem {
-        id: new_history_id(),
-        actions: undo_actions,
-        timestamp: now_secs(),
-        outcomes: undo_outcomes,
-    };
-    if let Err(e) = record_history(&undo_item) {
-        eprintln!("history: failed to record undo: {}", e);
+    let ok = refused.is_empty();
+    crate::render::undo_result(&id, restored, &refused, trash_skipped);
+
+    if !undo_outcomes.is_empty() {
+        let undo_actions = undo_outcomes
+            .iter()
+            .map(|o| Action {
+                src: o.src.clone(),
+                dst: o.dst.clone(),
+                op: o.op.clone(),
+                reason: Some(format!("undo of {}", hist.id)),
+                undoable: false,
+            })
+            .collect();
+        let undo_item = HistoryItem {
+            id: new_history_id(),
+            actions: undo_actions,
+            timestamp: now_secs(),
+            outcomes: undo_outcomes,
+            kind: "undo".to_string(),
+            origin: "manual".to_string(),
+            watch_root: None,
+        };
+        if let Err(e) = record_history(&undo_item) {
+            eprintln!("history: failed to record undo: {}", e);
+        }
     }
+    ok
 }
 
 /// Writes a history item to disk via a temp-file-then-rename, reporting

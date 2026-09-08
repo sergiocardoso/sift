@@ -1,3 +1,3 @@
-fn main() {
-    sift::cli::run();
+fn main() -> std::process::ExitCode {
+    sift::cli::run()
 }

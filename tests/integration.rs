@@ -149,7 +149,7 @@ fn test_apply_move_and_undo() {
         .any(|a| a.dst.as_ref() == Some(&dst) && matches!(a.op, Op::Move)));
     // Execute the full plan (including the CreateDir for Documents/) rather
     // than a hand-picked single action, since the Move depends on it.
-    sift::executor::execute_plan(plan, t.to_str().unwrap());
+    sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(dst.exists());
     assert!(!src.exists());
     for h in std::fs::read_dir(hist_dir.clone()).unwrap().flatten() {
@@ -228,7 +228,7 @@ fn test_failed_move_recorded_accurately_in_history() {
     // rather than silently succeeding or crashing.
     std::fs::create_dir_all(t.join("Documents")).unwrap();
     File::create(t.join("Documents/race.txt")).unwrap();
-    execute_plan(plan, t.to_str().unwrap());
+    execute_plan(plan, t.to_str().unwrap(), "organize", None);
 
     assert!(
         src.exists(),
@@ -279,7 +279,7 @@ fn test_history_written() {
         .actions
         .iter()
         .any(|a| a.dst.as_ref() == Some(&dst) && matches!(a.op, Op::Move)));
-    execute_plan(plan, t.to_str().unwrap());
+    execute_plan(plan, t.to_str().unwrap(), "organize", None);
     let found = std::fs::read_dir(hist_dir.clone())
         .unwrap()
         .flatten()
@@ -309,7 +309,7 @@ fn test_undo_refuses_occupied_original() {
         .actions
         .iter()
         .any(|a| a.dst.as_ref() == Some(&dst) && matches!(a.op, Op::Move)));
-    execute_plan(plan, t.to_str().unwrap());
+    execute_plan(plan, t.to_str().unwrap(), "organize", None);
     File::create(&src).unwrap();
     for h in std::fs::read_dir(hist_dir.clone()).unwrap().flatten() {
         let s = std::fs::read_to_string(h.path()).unwrap();
@@ -337,10 +337,10 @@ fn test_doctor_report_only_sensitive_filename() {
     let findings = doctor_findings(t);
     assert!(findings
         .iter()
-        .any(|f| f.path.ends_with("mysecret.env") && f.reason.contains("Suspicious filename")));
+        .any(|f| f.path.ends_with("mysecret.env") && f.reason.contains("Sensitive-looking")));
     assert!(!findings.iter().any(|f| f.path.ends_with("notes.txt")));
     // cmd_doctor must run without reading contents or mutating anything.
-    cmd_doctor(t.display().to_string(), true);
+    cmd_doctor(t.display().to_string(), true, false);
     assert!(std::fs::metadata(t.join("mysecret.env")).is_ok());
     assert!(std::fs::metadata(t.join("notes.txt")).is_ok());
 }
@@ -514,6 +514,9 @@ fn test_undo_ignores_unsuccessful_actions() {
         actions: vec![failed_move],
         timestamp: 0,
         outcomes: vec![outcome],
+        kind: "organize".into(),
+        origin: "manual".into(),
+        watch_root: None,
     };
     record_history(&item).unwrap();
 
@@ -540,7 +543,7 @@ fn test_undo_does_not_rewrite_original_history_record() {
     let dst = t.join("Documents/orig.txt");
     File::create(&src).unwrap();
     let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
-    sift::executor::execute_plan(plan, t.to_str().unwrap());
+    sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(dst.exists());
 
     let mut hist_file = None;
@@ -637,7 +640,7 @@ fn test_undo_refuses_when_destination_replaced_by_directory() {
         .actions
         .iter()
         .any(|a| a.dst.as_ref() == Some(&dst) && matches!(a.op, Op::Move)));
-    execute_plan(plan, t.to_str().unwrap());
+    execute_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(dst.exists());
     assert!(!src.exists());
 
@@ -757,6 +760,8 @@ fn test_config_move_destination_symlink_escape_rejected() {
             actions: vec![escape_move, escape_mkdir],
         },
         t.to_str().unwrap(),
+        "organize",
+        None,
     );
     assert_eq!(
         std::fs::read_dir(outside.path()).unwrap().count(),
@@ -767,5 +772,946 @@ fn test_config_move_destination_symlink_escape_rejected() {
         t.join("file.txt").exists(),
         "source must remain since the move must fail"
     );
+    clear_test_history_dir();
+}
+
+// ============================================================
+// Recursive traversal
+// ============================================================
+
+#[test]
+fn test_non_recursive_organize_ignores_nested_files() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("root.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/nested.jpg")).unwrap();
+
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(
+        !plan
+            .actions
+            .iter()
+            .any(|a| a.src.ends_with("nested/nested.jpg")
+                || a.dst
+                    .as_ref()
+                    .map(|d| d.ends_with("nested.jpg"))
+                    .unwrap_or(false)),
+        "non-recursive organize must never look inside a subdirectory"
+    );
+    // The nested directory itself is just skipped, like any other directory.
+    let nested_action = plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("nested"))
+        .unwrap();
+    assert_eq!(nested_action.op, Op::Skip);
+}
+
+#[test]
+fn test_recursive_organize_treats_each_directory_locally() {
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("root.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/nested.jpg")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let root_move = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("root.pdf"))
+        .unwrap();
+    assert_eq!(root_move.op, Op::Move);
+    assert_eq!(
+        root_move.dst.as_ref().unwrap(),
+        &t.join("Documents/root.pdf")
+    );
+
+    let nested_move = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("nested.jpg"))
+        .unwrap();
+    assert_eq!(nested_move.op, Op::Move);
+    assert_eq!(
+        nested_move.dst.as_ref().unwrap(),
+        &t.join("nested/Images/nested.jpg"),
+        "nested.jpg must land in nested/Images/, not be flattened into the root"
+    );
+    assert!(
+        !rp.plan
+            .actions
+            .iter()
+            .any(|a| a.dst.as_ref() == Some(&t.join("Images/nested.jpg"))),
+        "must never flatten a nested file into the root's own category folder"
+    );
+}
+
+#[test]
+fn test_recursive_organize_dry_run_no_mutation() {
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("root.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/nested.jpg")).unwrap();
+
+    let _ = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(t.join("root.pdf").exists());
+    assert!(t.join("nested/nested.jpg").exists());
+    assert!(!t.join("Documents").exists());
+    assert!(!t.join("nested/Images").exists());
+}
+
+#[test]
+fn test_recursive_organize_apply_moves_nested_files() {
+    use sift::executor::execute_plan;
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    assert!(hist_dir.starts_with(t));
+
+    File::create(t.join("root.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/nested.jpg")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let (_id, outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
+    assert!(outcomes.iter().all(|o| o.result.is_ok()));
+
+    assert!(t.join("Documents/root.pdf").exists());
+    assert!(t.join("nested/Images/nested.jpg").exists());
+    assert!(!t.join("root.pdf").exists());
+    assert!(!t.join("nested/nested.jpg").exists());
+    clear_test_history_dir();
+}
+
+#[test]
+fn test_recursive_organize_explicit_createdir_per_directory() {
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("root.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/nested.jpg")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(rp
+        .plan
+        .actions
+        .iter()
+        .any(|a| a.op == Op::CreateDir && a.src == t.join("Documents")));
+    assert!(rp
+        .plan
+        .actions
+        .iter()
+        .any(|a| a.op == Op::CreateDir && a.src == t.join("nested/Images")));
+}
+
+#[test]
+fn test_recursive_organize_does_not_reprocess_category_dirs() {
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("Documents")).unwrap();
+    File::create(t.join("Documents/existing.pdf")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(
+        !rp.plan
+            .actions
+            .iter()
+            .any(|a| a.src.ends_with("existing.pdf")),
+        "a file already inside a category directory must never be reprocessed"
+    );
+    assert!(
+        !rp.plan.actions.iter().any(|a| a
+            .dst
+            .as_ref()
+            .map(|d| d.ends_with("Documents/Documents"))
+            .unwrap_or(false)
+            || a.src.ends_with("Documents/Documents")),
+        "must never produce Documents/Documents-style repeated nesting"
+    );
+    // "Documents" itself is reported once, as a protected/off-limits entry.
+    let doc_action = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src == t.join("Documents"))
+        .unwrap();
+    assert_eq!(doc_action.op, Op::Skip);
+    assert_eq!(doc_action.reason.as_deref(), Some("category directory"));
+}
+
+#[test]
+fn test_recursive_discovery_excludes_category_dirs() {
+    use sift::scanner::discover_recursive_dirs;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    for name in sift::scanner::CATEGORY_DIR_NAMES {
+        std::fs::create_dir_all(t.join(name)).unwrap();
+    }
+    let dirs = discover_recursive_dirs(t);
+    assert_eq!(
+        dirs,
+        vec![t.to_path_buf()],
+        "no category directory may ever be a traversal target"
+    );
+}
+
+#[test]
+fn test_recursive_discovery_skips_hidden_dirs() {
+    use sift::scanner::discover_recursive_dirs;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join(".cache/inner")).unwrap();
+    let dirs = discover_recursive_dirs(t);
+    assert_eq!(dirs, vec![t.to_path_buf()]);
+}
+
+#[test]
+fn test_recursive_discovery_skips_symlink_dirs() {
+    use sift::scanner::discover_recursive_dirs;
+    use std::os::unix::fs::symlink;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let outside = tempdir().unwrap();
+    File::create(outside.path().join("secret.txt")).unwrap();
+    symlink(outside.path(), t.join("photos")).unwrap();
+
+    let dirs = discover_recursive_dirs(t);
+    assert_eq!(
+        dirs,
+        vec![t.to_path_buf()],
+        "a directory symlink must never be traversed, even to a real directory"
+    );
+}
+
+#[test]
+fn test_recursive_discovery_skips_broken_symlinks_safely() {
+    use sift::scanner::discover_recursive_dirs;
+    use std::os::unix::fs::symlink;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    symlink("/nonexistent-target-xyz", t.join("broken")).unwrap();
+
+    let dirs = discover_recursive_dirs(t);
+    assert_eq!(dirs, vec![t.to_path_buf()]);
+}
+
+#[test]
+fn test_recursive_discovery_stops_at_nested_project_root() {
+    use sift::planner::plan_organize_recursive;
+    use sift::scanner::discover_recursive_dirs;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("app/src")).unwrap();
+    std::fs::create_dir_all(t.join("app/target")).unwrap();
+    File::create(t.join("app/Cargo.toml")).unwrap();
+    File::create(t.join("app/src/main.rs")).unwrap();
+    File::create(t.join("app/target/binary")).unwrap();
+
+    let dirs = discover_recursive_dirs(t);
+    assert_eq!(
+        dirs,
+        vec![t.to_path_buf()],
+        "the whole nested project subtree (app/, app/src/, app/target/) must be protected"
+    );
+
+    // The organize plan must never touch anything inside the nested project.
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(!rp
+        .plan
+        .actions
+        .iter()
+        .any(|a| a.src.ends_with("main.rs") || a.src.ends_with("binary")));
+    let app_action = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src == t.join("app"))
+        .unwrap();
+    assert_eq!(app_action.op, Op::Skip);
+    assert_eq!(app_action.reason.as_deref(), Some("software project"));
+}
+
+#[test]
+fn test_recursive_discovery_skips_known_build_and_vcs_dir_names() {
+    use sift::scanner::discover_recursive_dirs;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    // Bare directories with these exact names, with no other project marker,
+    // must still never be traversed.
+    std::fs::create_dir_all(t.join("node_modules/inner")).unwrap();
+    std::fs::create_dir_all(t.join("target/inner")).unwrap();
+    std::fs::create_dir_all(t.join(".git/inner")).unwrap();
+    std::fs::create_dir_all(t.join(".venv/inner")).unwrap();
+
+    let dirs = discover_recursive_dirs(t);
+    assert_eq!(dirs, vec![t.to_path_buf()]);
+}
+
+#[test]
+fn test_recursive_organize_collision_in_nested_dir() {
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("nested/Documents")).unwrap();
+    File::create(t.join("nested/Documents/report.pdf")).unwrap();
+    File::create(t.join("nested/report.pdf")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let action = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src == t.join("nested/report.pdf"))
+        .unwrap();
+    assert_eq!(action.op, Op::Skip);
+    assert_eq!(action.reason.as_deref(), Some("collision"));
+}
+
+#[test]
+fn test_recursive_organize_broken_symlink_collision_in_nested_dir() {
+    use sift::planner::plan_organize_recursive;
+    use std::os::unix::fs::symlink;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("nested/Documents")).unwrap();
+    symlink("/nonexistent", t.join("nested/Documents/report.pdf")).unwrap();
+    File::create(t.join("nested/report.pdf")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let action = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src == t.join("nested/report.pdf"))
+        .unwrap();
+    assert_eq!(action.op, Op::Skip);
+    assert_eq!(action.reason.as_deref(), Some("collision"));
+}
+
+#[test]
+fn test_recursive_executor_toctou_collision_in_nested_dir() {
+    use sift::domain::HistoryItem;
+    use sift::executor::execute_plan;
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    assert!(hist_dir.starts_with(t));
+
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    let src = t.join("nested/race.txt");
+    File::create(&src).unwrap();
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+
+    // Race: the destination appears after planning but before execution.
+    std::fs::create_dir_all(t.join("nested/Documents")).unwrap();
+    File::create(t.join("nested/Documents/race.txt")).unwrap();
+
+    let (_id, outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
+    assert!(
+        src.exists(),
+        "a failed move must leave the source untouched"
+    );
+
+    let mut found_failure = false;
+    for h in std::fs::read_dir(&hist_dir).unwrap().flatten() {
+        let s = std::fs::read_to_string(h.path()).unwrap();
+        if let Ok(item) = serde_json::from_str::<HistoryItem>(&s) {
+            for o in &item.outcomes {
+                if o.src.ends_with("race.txt") && o.op == Op::Move {
+                    assert!(o.result.is_err());
+                    found_failure = true;
+                }
+            }
+        }
+    }
+    assert!(found_failure);
+    let _ = outcomes;
+    clear_test_history_dir();
+}
+
+#[test]
+fn test_recursive_executor_refuses_symlink_ancestor_escape() {
+    use std::os::unix::fs::symlink;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let outside = tempdir().unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/file.txt")).unwrap();
+    // Appears after any planning would have happened, deep under `nested/`.
+    symlink(outside.path(), t.join("nested/Escape")).unwrap();
+
+    let escape_move = sift::domain::Action {
+        src: t.join("nested/file.txt"),
+        dst: Some(t.join("nested/Escape").join("file.txt")),
+        op: Op::Move,
+        reason: Some("hand-crafted TOCTOU attempt".into()),
+        undoable: true,
+    };
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    sift::executor::execute_plan(
+        sift::domain::Plan {
+            actions: vec![escape_move],
+        },
+        t.to_str().unwrap(),
+        "organize-recursive",
+        None,
+    );
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    assert!(t.join("nested/file.txt").exists());
+    clear_test_history_dir();
+}
+
+#[test]
+fn test_recursive_history_records_one_operation() {
+    use sift::executor::execute_plan;
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    assert!(hist_dir.starts_with(t));
+
+    File::create(t.join("root.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/nested.jpg")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let (id, _outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
+
+    let files: Vec<_> = std::fs::read_dir(&hist_dir).unwrap().flatten().collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "one recursive apply must be exactly one history record"
+    );
+    let content = std::fs::read_to_string(files[0].path()).unwrap();
+    assert!(content.contains("root.pdf"));
+    assert!(content.contains("nested.jpg"));
+    assert!(content.contains(&id));
+    clear_test_history_dir();
+}
+
+#[test]
+fn test_recursive_undo_restores_nested_files() {
+    use sift::executor::execute_plan;
+    use sift::history::cmd_undo;
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    assert!(hist_dir.starts_with(t));
+
+    File::create(t.join("root.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/nested.jpg")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let (id, _outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
+    assert!(t.join("Documents/root.pdf").exists());
+    assert!(t.join("nested/Images/nested.jpg").exists());
+
+    cmd_undo(id);
+
+    assert!(t.join("root.pdf").exists());
+    assert!(t.join("nested/nested.jpg").exists());
+    assert!(!t.join("Documents/root.pdf").exists());
+    assert!(!t.join("nested/Images/nested.jpg").exists());
+    clear_test_history_dir();
+}
+
+#[test]
+fn test_recursive_doctor_finds_nested_findings() {
+    use sift::scanner::doctor_findings_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/SLACK_TOKEN.txt")).unwrap();
+
+    let findings = doctor_findings_recursive(t);
+    assert!(findings
+        .iter()
+        .any(|f| f.path.ends_with("nested/SLACK_TOKEN.txt") && f.reason.contains("Sensitive")));
+}
+
+#[test]
+fn test_recursive_doctor_does_not_inspect_protected_subtree() {
+    use sift::scanner::doctor_findings_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("app")).unwrap();
+    File::create(t.join("app/Cargo.toml")).unwrap();
+    File::create(t.join("app/SLACK_TOKEN.txt")).unwrap();
+
+    let findings = doctor_findings_recursive(t);
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.path.ends_with("app/SLACK_TOKEN.txt")),
+        "doctor must never inspect inside a protected project subtree"
+    );
+    assert!(findings
+        .iter()
+        .any(|f| f.path.ends_with("app") && f.reason.contains("Software project")));
+}
+
+#[test]
+fn test_recursive_scan_includes_nested_entries() {
+    use sift::scanner::scan_entries_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("root.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/nested.jpg")).unwrap();
+
+    let entries = scan_entries_recursive(t);
+    assert!(entries.iter().any(|e| e.path == t.join("root.pdf")));
+    assert!(entries.iter().any(|e| e.path == t.join("nested")));
+    assert!(entries
+        .iter()
+        .any(|e| e.path == t.join("nested/nested.jpg")));
+}
+
+#[test]
+fn test_recursive_discovery_is_deterministic() {
+    use sift::scanner::discover_recursive_dirs;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("b/inner")).unwrap();
+    std::fs::create_dir_all(t.join("a/inner")).unwrap();
+    std::fs::create_dir_all(t.join("c")).unwrap();
+
+    let first = discover_recursive_dirs(t);
+    let second = discover_recursive_dirs(t);
+    assert_eq!(first, second);
+    // root first, then lexicographic.
+    assert_eq!(first[0], t.to_path_buf());
+    assert!(first.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[test]
+fn test_clean_recursive_flag_rejected_by_cli() {
+    use clap::Parser;
+    use sift::cli::Cli;
+    let result = Cli::try_parse_from(["sift", "clean", ".", "--recursive"]);
+    assert!(
+        result.is_err(),
+        "clean must not accept --recursive; clap should reject it as unknown"
+    );
+}
+
+// ============================================================
+// Classification coverage: Code / Data / Other fallback
+// ============================================================
+
+fn move_dest<'a>(plan: &'a sift::domain::Plan, name: &str) -> &'a sift::domain::Action {
+    plan.actions
+        .iter()
+        .find(|a| a.src.file_name().and_then(|n| n.to_str()) == Some(name))
+        .unwrap_or_else(|| panic!("no action found for {name}"))
+}
+
+#[test]
+fn test_new_categories_and_fallback_classification() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("photo.svg")).unwrap();
+    File::create(t.join("PHOTO.JPG")).unwrap();
+    File::create(t.join("data.json")).unwrap();
+    File::create(t.join("codigo.js")).unwrap();
+    File::create(t.join("model.blend")).unwrap();
+    File::create(t.join("model.blend1")).unwrap();
+    File::create(t.join("arquivo-desconhecido.xyz")).unwrap();
+    File::create(t.join("README")).unwrap(); // no extension at all
+
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+
+    let expect_dir = |name: &str, dir: &str| {
+        let a = move_dest(&plan, name);
+        assert_eq!(a.op, Op::Move, "{name} should be moved, not skipped");
+        assert_eq!(
+            a.dst.as_ref().unwrap(),
+            &t.join(dir).join(name),
+            "{name} should land in {dir}/"
+        );
+    };
+    expect_dir("photo.svg", "Images");
+    expect_dir("PHOTO.JPG", "Images");
+    expect_dir("data.json", "Data");
+    expect_dir("codigo.js", "Code");
+    expect_dir("model.blend", "3D");
+    expect_dir("model.blend1", "3D");
+    expect_dir("arquivo-desconhecido.xyz", "Other");
+    expect_dir("README", "Other");
+}
+
+#[test]
+fn test_unclassified_no_longer_means_skip() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("mystery.xyz")).unwrap();
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let a = move_dest(&plan, "mystery.xyz");
+    assert_eq!(
+        a.op,
+        Op::Move,
+        "an ordinary unrecognized file must be organized into Other/, not skipped"
+    );
+    assert!(!plan
+        .actions
+        .iter()
+        .any(|a| a.src.ends_with("mystery.xyz") && a.op == Op::Skip));
+}
+
+#[test]
+fn test_hidden_unknown_file_still_skipped() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join(".hidden.xyz")).unwrap();
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let a = move_dest(&plan, ".hidden.xyz");
+    assert_eq!(a.op, Op::Skip);
+    assert_eq!(a.reason.as_deref(), Some("hidden file"));
+}
+
+#[test]
+fn test_symlink_unknown_file_still_skipped() {
+    use std::os::unix::fs::symlink;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let target = t.join("real.xyz");
+    File::create(&target).unwrap();
+    symlink(&target, t.join("link.xyz")).unwrap();
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let a = move_dest(&plan, "link.xyz");
+    assert_eq!(a.op, Op::Skip);
+    assert_eq!(a.reason.as_deref(), Some("symlink"));
+}
+
+#[test]
+fn test_broken_symlink_unknown_extension_still_skipped() {
+    use std::os::unix::fs::symlink;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    symlink("/nonexistent-xyz", t.join("dangling.xyz")).unwrap();
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let a = move_dest(&plan, "dangling.xyz");
+    assert_eq!(a.op, Op::Skip);
+    assert_eq!(a.reason.as_deref(), Some("symlink"));
+}
+
+#[test]
+fn test_protected_directory_never_gets_other_fallback() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    // A directory whose *name* looks like a file extension must still be
+    // treated as a directory, never classified/moved into Other/.
+    std::fs::create_dir_all(t.join("weird.xyz")).unwrap();
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let a = move_dest(&plan, "weird.xyz");
+    assert_eq!(a.op, Op::Skip);
+    assert_eq!(a.reason.as_deref(), Some("directory"));
+}
+
+#[test]
+fn test_project_root_subtree_never_extracted_into_other() {
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("my-app/src")).unwrap();
+    File::create(t.join("my-app/package.json")).unwrap();
+    File::create(t.join("my-app/src/index.js")).unwrap();
+    File::create(t.join("my-app/notes.xyz")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(
+        !rp.plan
+            .actions
+            .iter()
+            .any(|a| a.src.ends_with("index.js") || a.src.ends_with("notes.xyz")),
+        "nothing inside a protected project root may be classified or moved, \
+         even into the Code/Other fallback"
+    );
+    let app_action = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src == t.join("my-app"))
+        .unwrap();
+    assert_eq!(app_action.op, Op::Skip);
+    assert_eq!(app_action.reason.as_deref(), Some("software project"));
+}
+
+#[test]
+fn test_config_skip_overrides_builtin_data_category() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("keep.json")).unwrap();
+    let rules = vec![make_rule("skip json", "*.json", "Skip", None)];
+    let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+    let a = move_dest(&plan, "keep.json");
+    assert_eq!(
+        a.op,
+        Op::Skip,
+        "a config Skip rule must win over the built-in Data category"
+    );
+}
+
+#[test]
+fn test_config_move_overrides_builtin_code_category() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("script.js")).unwrap();
+    let rules = vec![make_rule("scripts", "*.js", "Move", Some("Scripts"))];
+    let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+    let a = move_dest(&plan, "script.js");
+    assert_eq!(a.op, Op::Move);
+    assert_eq!(a.dst.as_ref().unwrap(), &t.join("Scripts/script.js"));
+}
+
+#[test]
+fn test_collision_in_other_directory_is_skipped() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("Other")).unwrap();
+    File::create(t.join("Other/mystery.xyz")).unwrap();
+    File::create(t.join("mystery.xyz")).unwrap();
+
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let a = move_dest(&plan, "mystery.xyz");
+    assert_eq!(a.op, Op::Skip);
+    assert_eq!(a.reason.as_deref(), Some("collision"));
+}
+
+#[test]
+fn test_broken_symlink_collision_in_other_directory_is_skipped() {
+    use std::os::unix::fs::symlink;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("Other")).unwrap();
+    symlink("/nonexistent", t.join("Other/mystery.xyz")).unwrap();
+    File::create(t.join("mystery.xyz")).unwrap();
+
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let a = move_dest(&plan, "mystery.xyz");
+    assert_eq!(a.op, Op::Skip);
+    assert_eq!(a.reason.as_deref(), Some("collision"));
+}
+
+#[test]
+fn test_other_directory_creation_is_explicit_createdir() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("mystery.xyz")).unwrap();
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(plan
+        .actions
+        .iter()
+        .any(|a| a.op == Op::CreateDir && a.src == t.join("Other")));
+}
+
+#[test]
+fn test_recursive_new_categories_stay_local() {
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("foo.xyz")).unwrap();
+    std::fs::create_dir_all(t.join("nested")).unwrap();
+    File::create(t.join("nested/script.js")).unwrap();
+    File::create(t.join("nested/payload.json")).unwrap();
+    File::create(t.join("nested/model.blend")).unwrap();
+
+    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let dst_of = |name: &str| {
+        rp.plan
+            .actions
+            .iter()
+            .find(|a| a.src.file_name().and_then(|n| n.to_str()) == Some(name))
+            .unwrap()
+            .dst
+            .clone()
+            .unwrap()
+    };
+    assert_eq!(dst_of("foo.xyz"), t.join("Other/foo.xyz"));
+    assert_eq!(dst_of("script.js"), t.join("nested/Code/script.js"));
+    assert_eq!(dst_of("payload.json"), t.join("nested/Data/payload.json"));
+    assert_eq!(dst_of("model.blend"), t.join("nested/3D/model.blend"));
+    assert!(
+        !rp.plan.actions.iter().any(|a| a
+            .dst
+            .as_ref()
+            .map(|d| d.starts_with(t.join("Code"))
+                || d.starts_with(t.join("Data"))
+                || d.starts_with(t.join("3D")))
+            .unwrap_or(false)),
+        "nested files must never be flattened into the root's own category folders"
+    );
+}
+
+#[test]
+fn test_recursive_new_category_dirs_are_terminal() {
+    use sift::scanner::discover_recursive_dirs;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::create_dir_all(t.join("Code")).unwrap();
+    std::fs::create_dir_all(t.join("Data")).unwrap();
+    std::fs::create_dir_all(t.join("Other")).unwrap();
+    File::create(t.join("Code/old.js")).unwrap();
+    File::create(t.join("Data/old.json")).unwrap();
+    File::create(t.join("Other/old.xyz")).unwrap();
+
+    let dirs = discover_recursive_dirs(t);
+    assert_eq!(
+        dirs,
+        vec![t.to_path_buf()],
+        "Code/Data/Other must be terminal, exactly like Documents/Images"
+    );
+}
+
+#[test]
+fn test_organize_second_run_is_idempotent() {
+    use sift::executor::execute_plan;
+    use sift::planner::plan_organize_recursive;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    assert!(hist_dir.starts_with(t));
+
+    File::create(t.join("root.pdf")).unwrap();
+    File::create(t.join("script.js")).unwrap();
+    File::create(t.join("data.json")).unwrap();
+    File::create(t.join("mystery.xyz")).unwrap();
+
+    let rp1 = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    execute_plan(rp1.plan, t.to_str().unwrap(), "organize-recursive", None);
+
+    // Run again on the now-organized tree.
+    let rp2 = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(
+        !rp2.plan.actions.iter().any(|a| a.op == Op::Move),
+        "a second run must find nothing left to move"
+    );
+    assert!(!t.join("Documents/Documents").exists());
+    assert!(!t.join("Code/Code").exists());
+    assert!(!t.join("Data/Data").exists());
+    assert!(!t.join("Other/Other").exists());
+    clear_test_history_dir();
+}
+
+#[test]
+fn test_executor_toctou_protection_applies_to_other_category() {
+    use sift::domain::HistoryItem;
+    use sift::executor::execute_plan;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    assert!(hist_dir.starts_with(t));
+
+    let src = t.join("race.xyz");
+    File::create(&src).unwrap();
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    assert!(plan
+        .actions
+        .iter()
+        .any(|a| a.src.ends_with("race.xyz") && a.op == Op::Move));
+
+    // Race: destination appears after planning but before execution.
+    std::fs::create_dir_all(t.join("Other")).unwrap();
+    File::create(t.join("Other/race.xyz")).unwrap();
+
+    execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    assert!(
+        src.exists(),
+        "a failed move must leave the source untouched"
+    );
+
+    let mut found_failure = false;
+    for h in std::fs::read_dir(&hist_dir).unwrap().flatten() {
+        let s = std::fs::read_to_string(h.path()).unwrap();
+        if let Ok(item) = serde_json::from_str::<HistoryItem>(&s) {
+            for o in &item.outcomes {
+                if o.src.ends_with("race.xyz") && o.op == Op::Move {
+                    assert!(o.result.is_err());
+                    found_failure = true;
+                }
+            }
+        }
+    }
+    assert!(found_failure);
+    clear_test_history_dir();
+}
+
+#[test]
+fn test_dry_run_zero_mutation_for_new_categories() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("photo.svg")).unwrap();
+    File::create(t.join("data.json")).unwrap();
+    File::create(t.join("codigo.js")).unwrap();
+    File::create(t.join("model.blend")).unwrap();
+    File::create(t.join("mystery.xyz")).unwrap();
+
+    let _ = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    for name in ["Images", "Data", "Code", "3D", "Other"] {
+        assert!(
+            !t.join(name).exists(),
+            "planning must never create {name}/ before --apply"
+        );
+    }
+    for name in [
+        "photo.svg",
+        "data.json",
+        "codigo.js",
+        "model.blend",
+        "mystery.xyz",
+    ] {
+        assert!(t.join(name).exists());
+    }
+}
+
+#[test]
+fn test_undo_restores_files_moved_into_new_categories() {
+    use sift::executor::execute_plan;
+    use sift::history::cmd_undo;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    assert!(hist_dir.starts_with(t));
+
+    File::create(t.join("codigo.js")).unwrap();
+    File::create(t.join("data.json")).unwrap();
+    File::create(t.join("mystery.xyz")).unwrap();
+
+    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let (id, _outcomes) = execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    assert!(t.join("Code/codigo.js").exists());
+    assert!(t.join("Data/data.json").exists());
+    assert!(t.join("Other/mystery.xyz").exists());
+
+    cmd_undo(id);
+
+    assert!(t.join("codigo.js").exists());
+    assert!(t.join("data.json").exists());
+    assert!(t.join("mystery.xyz").exists());
+    assert!(!t.join("Code/codigo.js").exists());
+    assert!(!t.join("Data/data.json").exists());
+    assert!(!t.join("Other/mystery.xyz").exists());
     clear_test_history_dir();
 }

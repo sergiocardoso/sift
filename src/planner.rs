@@ -31,7 +31,9 @@ fn dir_status(dir: &Path) -> DirStatus {
 
 /// Built-in destination directory name and human-readable reason for a
 /// classified category. Categories with no built-in organize destination
-/// (Unknown, Junk, BuildOutput, Sensitive) return `None`.
+/// (Junk is trashed, not moved; Unknown/BuildOutput/Sensitive are never
+/// produced for an ordinary file organize actually classifies — see
+/// `CategoryDB::classify`) return `None`.
 fn builtin_destination(cat: Category) -> Option<(&'static str, &'static str)> {
     match cat {
         Category::Document => Some(("Documents", "Document")),
@@ -40,6 +42,9 @@ fn builtin_destination(cat: Category) -> Option<(&'static str, &'static str)> {
         Category::Audio => Some(("Audio", "Audio")),
         Category::Archive => Some(("Archives", "Archive")),
         Category::ThreeD => Some(("3D", "3D asset")),
+        Category::Code => Some(("Code", "Code")),
+        Category::Data => Some(("Data", "Data")),
+        Category::Other => Some(("Other", "Other")),
         Category::Junk | Category::BuildOutput | Category::Sensitive | Category::Unknown => None,
     }
 }
@@ -49,6 +54,21 @@ fn is_builtin_junk(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|ext| ["tmp", "swp", "swo"].contains(&ext))
         .unwrap_or(false)
+}
+
+/// Canonical, short skip reason for an entry that's categorically excluded
+/// from mutation (never a rule/collision reason — those are decided later).
+/// These exact strings are what the human-readable renderer keys off of to
+/// group/label skips, so keep them short and stable. Delegates the shared
+/// symlink/project/protected/hidden condition to `scanner::protection_reason`
+/// (also used by recursive traversal eligibility) and adds the one case
+/// specific to organize/clean: a plain directory is never itself moved.
+fn categorical_skip_reason(entry: &Entry) -> Option<&'static str> {
+    crate::scanner::protection_reason(entry).or(if entry.is_dir {
+        Some("directory")
+    } else {
+        None
+    })
 }
 
 fn glob_match(pattern: &str, path: &Path) -> bool {
@@ -82,8 +102,8 @@ fn classify_for_organize(
     rules: &[&Rule],
     builtin: &CategoryDB,
 ) -> Decision {
-    if entry.is_dir || entry.is_symlink || entry.protected || entry.hidden {
-        return Decision::Skip("Directory/symlink/protected/hidden".into());
+    if let Some(reason) = categorical_skip_reason(entry) {
+        return Decision::Skip(reason.into());
     }
     for rule in rules {
         if !glob_match(&rule.pattern, &entry.path) {
@@ -92,38 +112,38 @@ fn classify_for_organize(
         let reason = rule
             .description
             .clone()
-            .unwrap_or_else(|| format!("Config rule: {}", rule.name));
+            .unwrap_or_else(|| format!("config rule: {}", rule.name));
         return match rule.action.as_str() {
             "Skip" => Decision::Skip(reason),
             "Trash" => Decision::Trash(reason),
             "Move" => {
                 let dest = match rule.destination.as_deref() {
                     Some(d) => d,
-                    None => return Decision::Skip("Move rule missing destination".into()),
+                    None => return Decision::Skip("move rule missing destination".into()),
                 };
                 if !validate_rule_destination(dest) {
-                    return Decision::Skip("Unsafe config destination rejected".into());
+                    return Decision::Skip("unsafe config destination".into());
                 }
                 match safe_join_under(target, Path::new(dest)) {
                     Some(dest_dir) => Decision::Move { dest_dir, reason },
-                    None => Decision::Skip("Unsafe config destination rejected".into()),
+                    None => Decision::Skip("unsafe config destination".into()),
                 }
             }
-            _ => Decision::Skip("Invalid rule config".into()),
+            _ => Decision::Skip("invalid rule config".into()),
         };
     }
     let mut classified = entry.clone();
     builtin.classify(&mut classified);
     match classified.classified_as {
-        Some(Category::Junk) => Decision::Trash("Built-in junk file".into()),
+        Some(Category::Junk) => Decision::Trash("built-in junk file".into()),
         Some(cat) => match builtin_destination(cat) {
             Some((name, reason)) => Decision::Move {
                 dest_dir: target.join(name),
                 reason: reason.into(),
             },
-            None => Decision::Skip("Unclassified/unknown".into()),
+            None => Decision::Skip("unknown type".into()),
         },
-        None => Decision::Skip("Unclassified/unknown".into()),
+        None => Decision::Skip("unknown type".into()),
     }
 }
 
@@ -168,16 +188,14 @@ fn resolve_organize_action(
             undoable: false,
         },
         Decision::Move { dest_dir, reason } => match dir_status(&dest_dir) {
-            DirStatus::Blocked => {
-                skip_with_intended_dst(dest_dir, "Destination directory occupied by non-directory")
-            }
+            DirStatus::Blocked => skip_with_intended_dst(dest_dir, "collision"),
             status => {
                 let Some(filename) = entry.path.file_name() else {
-                    return skip("Entry has no file name");
+                    return skip("entry has no file name");
                 };
                 let dest = dest_dir.join(filename);
                 if std::fs::symlink_metadata(&dest).is_ok() {
-                    skip_with_intended_dst(dest, "Destination exists (collision)")
+                    skip_with_intended_dst(dest, "collision")
                 } else {
                     if matches!(status, DirStatus::Missing) {
                         needed_dirs.insert(dest_dir.clone());
@@ -195,11 +213,50 @@ fn resolve_organize_action(
     }
 }
 
+/// One entry's organize plan: the `CreateDir` its destination needs (if
+/// any, and if not already a real directory), and the entry's own action.
+pub struct EntryPlan {
+    pub create_dir: Option<Action>,
+    pub action: Action,
+}
+
+/// Plans the organize action for exactly one already-described entry
+/// within `containing_dir`, reusing the identical per-entry logic manual
+/// `organize` uses (config precedence, built-in classification, the
+/// Code/Data/Other fallback, collision detection via live
+/// `symlink_metadata`, explicit `CreateDir`). This is watch's sole
+/// authority for turning one filesystem candidate into a plan — it must
+/// never duplicate that decision logic itself.
+///
+/// Safety notes for callers: this only decides *what* to do; it does not
+/// re-validate that `entry`/`containing_dir` are still safe against the
+/// live filesystem (see `scanner::revalidate_candidate` for that), and it
+/// does not execute anything (see `executor::execute_plan`, which
+/// independently re-validates immediately before mutating).
+pub fn plan_entry_organize(
+    entry: &Entry,
+    containing_dir: &Path,
+    config_rules: &[Rule],
+    builtin: &CategoryDB,
+) -> EntryPlan {
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let action = resolve_organize_action(entry, containing_dir, &rules, builtin, &mut needed_dirs);
+    let create_dir = needed_dirs.into_iter().next().map(|dir| Action {
+        src: dir,
+        dst: None,
+        op: Op::CreateDir,
+        reason: Some("ensure directory exists".into()),
+        undoable: false,
+    });
+    EntryPlan { create_dir, action }
+}
+
 pub fn plan_organize(path: &str, config_rules: &[Rule], builtin: &CategoryDB) -> Plan {
     let target = Path::new(path);
     let entries = scan_entries(target);
     if is_project_root(target) {
-        return skip_all(&entries, "Target is project root");
+        return skip_all(&entries, "target is a software project root");
     }
     let rules = rules_by_priority(config_rules);
     let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
@@ -207,27 +264,99 @@ pub fn plan_organize(path: &str, config_rules: &[Rule], builtin: &CategoryDB) ->
         .iter()
         .map(|entry| resolve_organize_action(entry, target, &rules, builtin, &mut needed_dirs))
         .collect();
-    let mut actions: Vec<Action> = needed_dirs
+    let mut actions = createdir_actions(needed_dirs);
+    actions.extend(entry_actions);
+    Plan { actions }
+}
+
+fn createdir_actions(needed_dirs: BTreeSet<PathBuf>) -> Vec<Action> {
+    needed_dirs
         .into_iter()
         .map(|dir| Action {
             src: dir,
             dst: None,
             op: Op::CreateDir,
-            reason: Some("Ensure directory exists".into()),
+            reason: Some("ensure directory exists".into()),
             undoable: false,
         })
-        .collect();
+        .collect()
+}
+
+/// Result of planning a recursive organize: the flattened, multi-directory
+/// plan plus how many directories were actually scanned (a plain directory
+/// eligible for descent produces zero actions of its own, so this can't be
+/// recovered from the plan alone — it's needed for the "N directories
+/// scanned" summary in the human-readable view).
+pub struct RecursivePlan {
+    pub plan: Plan,
+    pub dirs_scanned: usize,
+}
+
+/// Organizes every eligible directory under `path` *in place*: each
+/// directory is its own local organize context (its files are classified
+/// and moved into local `Documents/`, `Images/`, etc. subfolders), never
+/// flattened into `path` itself. Discovery (`discover_recursive_dirs`) is a
+/// read-only snapshot taken up front — a directory this plan creates is
+/// never itself treated as a new traversal target.
+pub fn plan_organize_recursive(
+    path: &str,
+    config_rules: &[Rule],
+    builtin: &CategoryDB,
+) -> RecursivePlan {
+    let root = Path::new(path);
+    if is_project_root(root) {
+        return RecursivePlan {
+            plan: skip_all(&scan_entries(root), "target is a software project root"),
+            dirs_scanned: 0,
+        };
+    }
+    let dirs = crate::scanner::discover_recursive_dirs(root);
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut entry_actions: Vec<Action> = Vec::new();
+
+    for dir in &dirs {
+        for entry in scan_entries(dir) {
+            if entry.is_dir {
+                // Eligible subdirectories are transparent: they're in
+                // `dirs` and get their own iteration of this same loop.
+                // Only report a directory here if traversal stopped at it.
+                if let Some(reason) = crate::scanner::traversal_reason(&entry) {
+                    entry_actions.push(Action {
+                        src: entry.path.clone(),
+                        dst: None,
+                        op: Op::Skip,
+                        reason: Some(reason.into()),
+                        undoable: false,
+                    });
+                }
+                continue;
+            }
+            entry_actions.push(resolve_organize_action(
+                &entry,
+                dir,
+                &rules,
+                builtin,
+                &mut needed_dirs,
+            ));
+        }
+    }
+
+    let mut actions = createdir_actions(needed_dirs);
     actions.extend(entry_actions);
-    Plan { actions }
+    RecursivePlan {
+        plan: Plan { actions },
+        dirs_scanned: dirs.len(),
+    }
 }
 
 fn resolve_clean_action(entry: &Entry, rules: &[&Rule]) -> Action {
-    if entry.is_dir || entry.is_symlink || entry.protected || entry.hidden {
+    if let Some(reason) = categorical_skip_reason(entry) {
         return Action {
             src: entry.path.clone(),
             dst: None,
             op: Op::Skip,
-            reason: Some("Directory/symlink/protected/hidden".into()),
+            reason: Some(reason.into()),
             undoable: false,
         };
     }
@@ -238,7 +367,7 @@ fn resolve_clean_action(entry: &Entry, rules: &[&Rule]) -> Action {
         let reason = rule
             .description
             .clone()
-            .unwrap_or_else(|| format!("Config rule: {}", rule.name));
+            .unwrap_or_else(|| format!("config rule: {}", rule.name));
         return match rule.action.as_str() {
             "Trash" => Action {
                 src: entry.path.clone(),
@@ -258,14 +387,14 @@ fn resolve_clean_action(entry: &Entry, rules: &[&Rule]) -> Action {
                 src: entry.path.clone(),
                 dst: None,
                 op: Op::Skip,
-                reason: Some("Config rule specifies Move (not applicable to clean)".into()),
+                reason: Some("move rule not applicable to clean".into()),
                 undoable: false,
             },
             _ => Action {
                 src: entry.path.clone(),
                 dst: None,
                 op: Op::Skip,
-                reason: Some("Invalid rule config".into()),
+                reason: Some("invalid rule config".into()),
                 undoable: false,
             },
         };
@@ -275,7 +404,7 @@ fn resolve_clean_action(entry: &Entry, rules: &[&Rule]) -> Action {
             src: entry.path.clone(),
             dst: None,
             op: Op::Trash,
-            reason: Some("Built-in junk file".into()),
+            reason: Some("built-in junk file".into()),
             undoable: false,
         }
     } else {
@@ -283,7 +412,7 @@ fn resolve_clean_action(entry: &Entry, rules: &[&Rule]) -> Action {
             src: entry.path.clone(),
             dst: None,
             op: Op::Skip,
-            reason: Some("Not trash candidate".into()),
+            reason: Some("not trash candidate".into()),
             undoable: false,
         }
     }
@@ -293,7 +422,7 @@ pub fn plan_clean(path: &str, config_rules: &[Rule], _builtin: &CategoryDB) -> P
     let target = Path::new(path);
     let entries = scan_entries(target);
     if is_project_root(target) {
-        return skip_all(&entries, "Target is project root");
+        return skip_all(&entries, "target is a software project root");
     }
     let rules = rules_by_priority(config_rules);
     let actions = entries
@@ -303,60 +432,70 @@ pub fn plan_clean(path: &str, config_rules: &[Rule], _builtin: &CategoryDB) -> P
     Plan { actions }
 }
 
-pub fn cmd_organize(path: String, apply: bool, json: bool) {
+pub fn cmd_organize(path: String, apply: bool, json: bool, verbose: bool, recursive: bool) -> bool {
     let cfg_path = crate::config::find_config(&path);
     let config = cfg_path
         .and_then(|p| load_config(&p).ok())
         .unwrap_or_default();
     let builtins = CategoryDB::default();
-    let plan = plan_organize(&path, &config.rules, &builtins);
+    let root = is_project_root(Path::new(&path));
+
+    let (plan, dirs_scanned) = if recursive {
+        let recursive_plan = plan_organize_recursive(&path, &config.rules, &builtins);
+        (recursive_plan.plan, Some(recursive_plan.dirs_scanned))
+    } else {
+        (plan_organize(&path, &config.rules, &builtins), None)
+    };
+
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap());
-    } else {
-        println!("Plan: {} actions", plan.actions.len());
-        for (i, a) in plan.actions.iter().enumerate() {
-            let dst = a
-                .dst
-                .as_ref()
-                .map(|d| d.display().to_string())
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "{:2}: {:?} {} -> {} | reason: {}",
-                i + 1,
-                a.op,
-                a.src.display(),
-                dst,
-                a.reason.clone().unwrap_or_default()
-            );
+    } else if !apply {
+        match dirs_scanned {
+            Some(n) => {
+                crate::render::organize_dry_run_recursive(&path, &plan.actions, n, root, verbose)
+            }
+            None => crate::render::organize_dry_run(&path, &plan.actions, root, verbose),
         }
     }
-    if apply {
-        crate::executor::execute_plan(plan, &path);
+
+    if !apply {
+        return true;
     }
+    let kind = if recursive {
+        "organize-recursive"
+    } else {
+        "organize"
+    };
+    let (hist_id, outcomes) = crate::executor::execute_plan(plan, &path, kind, None);
+    let ok = !outcomes.iter().any(|o| o.result.is_err());
+    if !json {
+        crate::render::organize_apply_result(&path, &outcomes, &hist_id);
+    }
+    ok
 }
 
-pub fn cmd_clean(path: String, apply: bool, json: bool) {
+pub fn cmd_clean(path: String, apply: bool, json: bool, verbose: bool) -> bool {
     let cfg_path = crate::config::find_config(&path);
     let config = cfg_path
         .and_then(|p| load_config(&p).ok())
         .unwrap_or_default();
     let builtins = CategoryDB::default();
     let plan = plan_clean(&path, &config.rules, &builtins);
+    let root = is_project_root(Path::new(&path));
+
     if json {
         println!("{}", serde_json::to_string_pretty(&plan).unwrap());
-    } else {
-        println!("Clean plan: {} actions", plan.actions.len());
-        for (i, a) in plan.actions.iter().enumerate() {
-            println!(
-                "{:2}: {:?} {} | reason: {}",
-                i + 1,
-                a.op,
-                a.src.display(),
-                a.reason.clone().unwrap_or_default()
-            );
-        }
+    } else if !apply {
+        crate::render::clean_dry_run(&path, &plan.actions, root, verbose);
     }
-    if apply {
-        crate::executor::execute_plan(plan, &path);
+
+    if !apply {
+        return true;
     }
+    let (hist_id, outcomes) = crate::executor::execute_plan(plan, &path, "clean", None);
+    let ok = !outcomes.iter().any(|o| o.result.is_err());
+    if !json {
+        crate::render::clean_apply_result(&path, &outcomes, &hist_id);
+    }
+    ok
 }
