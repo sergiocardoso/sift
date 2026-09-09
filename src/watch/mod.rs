@@ -47,10 +47,21 @@ pub fn cmd_watch_add(path: String, auto_apply: bool, recursive: bool) -> bool {
     // If this root already has a local `.sift.toml`, it must be valid
     // before we ever register an auto-apply watch against it — never
     // register a watch whose policy is already known to be broken.
-    if let Err(e) = crate::config::resolve_policy(&canonical.to_string_lossy()) {
-        eprintln!("Refusing to add watch: invalid configuration.");
-        eprintln!("{e}");
-        return false;
+    match crate::config::resolve_policy(&canonical.to_string_lossy()) {
+        Ok(policy) => {
+            if recursive && !policy.strategy.supports_recursive() {
+                eprintln!(
+                    "Refusing to add recursive watch: strategy = \"{}\" does not support --recursive yet.",
+                    policy.strategy.as_str()
+                );
+                return false;
+            }
+        }
+        Err(e) => {
+            eprintln!("Refusing to add watch: invalid configuration.");
+            eprintln!("{e}");
+            return false;
+        }
     }
     match registry::add(canonical.clone(), true, recursive) {
         Ok(_) => {

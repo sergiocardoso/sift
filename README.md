@@ -198,6 +198,16 @@ sift undo hist-<operation-id>
 
 Sift is written in Rust.
 
+## Install script
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sergiocardoso/sift/main/install.sh | sh
+```
+
+Downloads the latest prebuilt release for your OS/architecture (Linux and macOS, x86_64/aarch64), verifies its SHA256 checksum, and installs it to `~/.local/bin/sift` — never with `sudo`. It also checks whether `ffprobe` is on your `PATH`; if not, it only ever *tells* you the right command to install it for your system, and offers to run that command for you only in an interactive terminal, only after you say yes.
+
+`ffprobe` is entirely optional. Sift's `video` organize strategy works without it (MP4/MOV containers only) and uses it automatically for broader format support and richer metadata (`{duration}`, `{fps}`) when it's installed — see "Metadata-driven organize strategies" below.
+
 ## Build from source
 
 ```bash
@@ -1155,6 +1165,99 @@ enabled = true
 In `organize`, `Move`, `Trash`, and `Skip` rules are meaningful.
 
 In `clean`, `Trash` and `Skip` are meaningful; a `Move` rule is not applied as a move by the cleanup planner.
+
+---
+
+# Metadata-driven organize strategies
+
+Besides `strategy = "type"` (classification by extension), `.sift.toml` supports five strategies that render a destination from a `template` string instead:
+
+| Strategy | Metadata source | Example template |
+|---|---|---|
+| `date` | filesystem modification time | `"{year}/{month}"` |
+| `audio` | tag metadata (ID3v2, Vorbis comments, MP4 atoms, ...) | `"{artist}/{album}"` |
+| `video` | MP4/MOV container info | `"{resolution}/{year}"` |
+| `photos` | EXIF metadata | `"{camera}/{year}"` |
+| `documents` | PDF `/Info` or Office `docProps/core.xml` | `"{author}/{year}"` |
+
+`[[rules]]` always wins over any of these, exactly as with `type`.
+
+## `date`
+
+```toml
+[organize]
+strategy = "date"
+template = "{year}/{month}"
+```
+
+Supported placeholders: `{year}`, `{month}`, `{day}`. `organize.date_source` defaults to (and currently only supports) `"modified"`.
+
+## `audio`
+
+```toml
+[organize]
+strategy = "audio"
+template = "{artist}/{album}"
+```
+
+Reads tag metadata via [`lofty`](https://crates.io/crates/lofty) — mp3, flac, m4a, ogg, opus, wav, wma, aiff, and more. Supported placeholders: `{artist}`, `{album}`, `{album_artist}`, `{genre}`, `{track}`, `{title}`, `{year}`.
+
+## `video`
+
+```toml
+[organize]
+strategy = "video"
+template = "{resolution}/{year}"
+```
+
+Reads container-level metadata via a pure-Rust parser (MP4/MOV only, no dependency on any external tool) by default. If `ffprobe` is installed and on `PATH`, Sift uses it automatically instead — same `{width}`/`{height}`/`{resolution}`/`{codec}`/`{year}` values either way (`{codec}` always renders the raw fourcc, e.g. `avc1`, never `ffprobe`'s friendlier codec name, so a template you wrote before installing `ffmpeg` never silently points somewhere new afterward), plus broader container support and two extra placeholders:
+
+| Placeholder | Source | Requires `ffprobe`? |
+|---|---|---|
+| `{width}`, `{height}`, `{resolution}` (`WIDTHxHEIGHT`) | video track dimensions | No |
+| `{codec}` | raw fourcc, e.g. `avc1` | No |
+| `{year}` | the container's creation time, when set | No |
+| `{duration}` | length in whole seconds | Yes |
+| `{fps}` | rounded frame rate | Yes |
+
+There is never a shell-injection risk: the file path is always passed as a separate process argument, never interpolated into a shell command. If `ffprobe` isn't installed, `{duration}`/`{fps}` are simply unavailable — see below.
+
+## `photos`
+
+```toml
+[organize]
+strategy = "photos"
+template = "{camera}/{year}/{month}"
+```
+
+Reads EXIF metadata via [`kamadak-exif`](https://crates.io/crates/kamadak-exif) (pure Rust, no external tool) — JPEG, TIFF, HEIF/HEIC, PNG, and WebP are all auto-detected. Supported placeholders: `{camera}` (Make+Model, deduplicated when the model already repeats the make, e.g. `"Canon EOS R5"` rather than `"Canon Canon EOS R5"`), `{year}`, `{month}`, `{day}` (from `DateTimeOriginal` — the capture date, never the file's mtime).
+
+There is deliberately no `{gps}`/location placeholder: embedding capture coordinates in a folder name is an easy way to leak where a photo was taken without meaning to.
+
+## `documents`
+
+```toml
+[organize]
+strategy = "documents"
+template = "{author}/{year}"
+```
+
+Reads metadata from PDF and Office files (docx/xlsx/pptx), normalized into the same shape regardless of format:
+
+| Format | Source |
+|---|---|
+| PDF | the `/Info` dictionary, via the pure-Rust [`lopdf`](https://crates.io/crates/lopdf) crate |
+| docx/xlsx/pptx | `docProps/core.xml` inside the zip, via the pure-Rust [`zip`](https://crates.io/crates/zip) + [`roxmltree`](https://crates.io/crates/roxmltree) crates |
+
+Supported placeholders: `{author}`, `{title}`, `{year}`, `{month}`, `{day}` (the document's own recorded creation date — PDF's `CreationDate`, Office's `dcterms:created` — never the file's mtime).
+
+## Missing metadata is a skip, never a guess
+
+If a file is missing a tag/field the template references (an untagged mp3, a photo with no EXIF data, a PDF with no `/Info` dictionary), that file is **skipped** with a clear reason — Sift never invents a fallback bucket like `Unknown Artist/`. Run `sift explain <file>` to see exactly which field was unavailable.
+
+## `audio`/`video`/`photos`/`documents` don't support `--recursive` yet
+
+Unlike `date`'s fixed-width `{year}`/`{month}`/`{day}`, an `{artist}`, `{camera}`, or `{author}` value is free text — structurally indistinguishable from any other folder name. That means there's currently no safe way to detect "this directory was generated by this same policy" and avoid re-entering it on a second run. `sift organize --recursive` and `sift watch add --recursive` both refuse `strategy = "audio"`/`"video"`/`"photos"`/`"documents"` with a clear error instead of guessing; a plain (non-recursive) `sift organize` and non-recursive `sift watch` work normally.
 
 ---
 

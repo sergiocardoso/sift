@@ -1,0 +1,248 @@
+================================================================================
+SIFT - EXEMPLOS DE TODOS OS PARAMETROS DO .sift.toml (PARA TESTES)
+================================================================================
+
+Como usar: crie uma pasta de teste, cole o bloco .sift.toml da estrategia
+que quer testar dentro dela (arquivo chamado exatamente ".sift.toml"),
+coloque alguns arquivos de teste, e rode:
+
+  sift config check <pasta>        -> valida o .sift.toml
+  sift explain <pasta>/arquivo.ext -> mostra o que aconteceria com 1 arquivo
+  sift organize <pasta>            -> mostra o plano (dry-run, nao move nada)
+  sift organize <pasta> --apply    -> aplica de verdade
+
+Nunca precisa de --apply pra testar; sift explain e organize (sem --apply)
+nunca tocam em nada no disco.
+
+================================================================================
+1) ESTRUTURA COMPLETA DO ARQUIVO .sift.toml (TODOS OS CAMPOS POSSIVEIS)
+================================================================================
+
+version = 1
+
+[organize]
+strategy = "type"            # "type" | "date" | "audio" | "video" | "photos" | "documents"
+unknown = "other"             # "other" | "skip"  (so' vale pra strategy = "type")
+template = "{year}/{month}"   # so' vale pra date/audio/video/photos/documents
+date_source = "modified"      # so' vale pra strategy = "date" (unico valor suportado hoje)
+
+[watch]
+stability_seconds = 3         # inteiro entre 1 e 300
+
+[[rules]]
+name = "nome legivel (opcional)"
+pattern = "*.tmp"             # glob simples: "*.ext" ou nome exato
+action = "Move"               # "Move" | "Trash" | "Skip"
+destination = "Pasta"         # obrigatorio so' quando action = "Move"
+priority = 100                # maior = avaliado primeiro
+enabled = true                # false = regra ignorada (default e' false se omitido)
+description = "motivo legivel mostrado no explain/organize (opcional)"
+
+================================================================================
+2) strategy = "type"  (classificacao por extensao — o padrao)
+================================================================================
+
+[organize]
+strategy = "type"
+unknown = "other"    # "skip" deixa arquivo sem categoria intocado
+
+# Nao usa "template". Destinos fixos: Documents/ Images/ Video/ Audio/
+# Archives/ 3D/ Code/ Data/ Other/
+
+================================================================================
+3) strategy = "date"  (mtime do arquivo)
+================================================================================
+
+[organize]
+strategy = "date"
+template = "{year}/{month}/{day}"   # placeholders de largura fixa (digitos)
+date_source = "modified"             # unico valor suportado
+
+# Placeholders disponiveis: {year} {month} {day}
+# Suporta --recursive (unica das "metadata-driven" que suporta, junto com "type")
+
+# Outros exemplos de template pra "date":
+#   template = "{year}"
+#   template = "{year}/{month}"
+#   template = "Backup/{year}/{month}/{day}"
+
+================================================================================
+4) strategy = "audio"  (tags de audio via lofty — mp3/flac/m4a/ogg/opus/wav/wma/aiff)
+================================================================================
+
+[organize]
+strategy = "audio"
+template = "{artist}/{album}"
+
+# TODOS os placeholders disponiveis para audio:
+#   {artist}        - artista da faixa
+#   {album}         - album
+#   {album_artist}  - artista do album (pode diferir de {artist} em compilacoes)
+#   {genre}         - genero
+#   {track}         - numero da faixa
+#   {title}         - titulo da musica
+#   {year}          - ano gravado na tag (NUNCA o mtime do arquivo)
+
+# Exemplo usando todos de uma vez (so' pra testar, na pratica seria exagero):
+#   template = "{artist}/{album}/{year} - {track} - {title} ({genre}) [{album_artist}]"
+
+# NAO suporta --recursive. Arquivo sem a tag necessaria = SKIP (nunca cria
+# pasta "Unknown Artist").
+
+================================================================================
+5) strategy = "video"  (container MP4/MOV puro-Rust; ffprobe opcional automatico)
+================================================================================
+
+[organize]
+strategy = "video"
+template = "{resolution}/{year}"
+
+# Placeholders SEMPRE disponiveis (parser Rust puro, so' MP4/MOV):
+#   {width}       - largura em pixels
+#   {height}      - altura em pixels
+#   {resolution}  - "LARGURAxALTURA", ex: "1920x1080"
+#   {codec}       - fourcc bruto, ex: "avc1", "hvc1" (NUNCA muda mesmo com ffprobe)
+#   {year}        - data de criacao do container, quando o encoder gravou uma
+
+# Placeholders que EXIGEM ffprobe instalado (senao ficam indisponiveis = skip):
+#   {duration}    - duracao em segundos inteiros
+#   {fps}         - taxa de quadros arredondada
+
+# Exemplo usando os campos que exigem ffprobe:
+#   template = "{resolution}/{codec}/{duration}s-{fps}fps"
+
+# Testar se o ffprobe esta sendo usado:
+#   which ffprobe                 -> confirma se esta instalado
+#   sift explain video.mp4        -> mostra "duration"/"fps" preenchidos ou "(none, requires ffprobe)"
+
+# NAO suporta --recursive.
+
+================================================================================
+6) strategy = "photos"  (EXIF via kamadak-exif — JPEG/TIFF/HEIF/HEIC/PNG/WebP)
+================================================================================
+
+[organize]
+strategy = "photos"
+template = "{camera}/{year}/{month}"
+
+# TODOS os placeholders disponiveis para photos:
+#   {camera}  - fabricante+modelo (Make+Model do EXIF), deduplicado
+#               ex: "Apple iPhone 13", "Canon EOS R5" (nunca "Canon Canon EOS R5")
+#   {year}    - ano de DateTimeOriginal (data de CAPTURA, nunca o mtime)
+#   {month}   - mes (2 digitos)
+#   {day}     - dia (2 digitos)
+
+# NAO existe {gps}/localizacao (decisao deliberada: evita vazar onde a foto
+# foi tirada no nome de uma pasta).
+
+# Exemplo usando todos:
+#   template = "{camera}/{year}/{month}/{day}"
+
+# NAO suporta --recursive.
+
+================================================================================
+7) strategy = "documents"  (PDF /Info via lopdf; Office docProps via zip+roxmltree)
+================================================================================
+
+[organize]
+strategy = "documents"
+template = "{author}/{year}"
+
+# TODOS os placeholders disponiveis para documents:
+#   {author}  - autor (PDF: Author | Office: dc:creator)
+#   {title}   - titulo (PDF: Title | Office: dc:title)
+#   {year}    - ano de criacao (PDF: CreationDate | Office: dcterms:created)
+#   {month}   - mes (2 digitos)
+#   {day}     - dia (2 digitos)
+
+# Formatos suportados: .pdf .docx .xlsx .pptx
+
+# Exemplo usando todos:
+#   template = "{author}/{year}/{month}/{title}"
+
+# NAO suporta --recursive.
+
+================================================================================
+8) EXEMPLO DE [[rules]] (funciona com QUALQUER strategy — sempre vence)
+================================================================================
+
+[[rules]]
+name = "arquivos temporarios"
+pattern = "*.tmp"
+action = "Trash"
+priority = 300
+enabled = true
+description = "Lixo temporario, direto pra lixeira"
+
+[[rules]]
+name = "nunca mexer nas notas"
+pattern = "notes.md"
+action = "Skip"
+priority = 200
+enabled = true
+
+[[rules]]
+name = "zip vai pra Archives"
+pattern = "*.zip"
+action = "Move"
+destination = "Archives"
+priority = 100
+enabled = true
+description = "Mantem zips juntos"
+
+================================================================================
+9) COMBO: arquivo .sift.toml completo, com TODAS as secoes preenchidas
+   (usando strategy = "documents" como exemplo — troque a vontade)
+================================================================================
+
+version = 1
+
+[organize]
+strategy = "documents"
+template = "{author}/{year}/{month}"
+
+[watch]
+stability_seconds = 5
+
+[[rules]]
+name = "nunca organizar contratos"
+pattern = "contrato*.pdf"
+action = "Skip"
+priority = 500
+enabled = true
+description = "Contratos ficam onde estao"
+
+[[rules]]
+name = "rascunhos vao pra lixeira"
+pattern = "*.tmp"
+action = "Trash"
+priority = 100
+enabled = true
+
+================================================================================
+10) COMANDOS UTEIS PRA TESTAR TUDO ISSO DE UMA VEZ
+================================================================================
+
+# validar o .sift.toml sem tocar em nada:
+sift config check /caminho/da/pasta
+
+# validar em JSON (bom pra scriptar testes):
+sift config check /caminho/da/pasta --json
+
+# ver exatamente o que aconteceria com UM arquivo especifico e por que:
+sift explain /caminho/da/pasta/arquivo.ext
+
+# ver o plano completo sem aplicar (dry-run, seguro):
+sift organize /caminho/da/pasta
+
+# ver o plano em JSON:
+sift organize /caminho/da/pasta --json
+
+# aplicar de verdade:
+sift organize /caminho/da/pasta --apply
+
+# desfazer a ultima operacao (usa o id mostrado depois do --apply):
+sift undo <id-do-historico>
+
+# --recursive SO funciona com strategy = "type" ou "date":
+sift organize /caminho/da/pasta --recursive

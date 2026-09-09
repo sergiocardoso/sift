@@ -7,6 +7,7 @@ pub mod explain;
 pub mod folders;
 pub mod fs;
 pub mod history;
+pub mod metadata;
 pub mod planner;
 pub mod render;
 pub mod scanner;

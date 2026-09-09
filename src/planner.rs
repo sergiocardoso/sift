@@ -39,6 +39,34 @@ pub(crate) enum DecisionCause {
     /// selected Date, so an unavailable date is a Skip, not a fallback to
     /// Type.
     DateUnavailable(String),
+    /// `strategy = "audio"` rendered a destination from this file's tag
+    /// metadata.
+    AudioMatched(crate::config::AudioMetadata),
+    /// `strategy = "audio"` could not safely obtain audio metadata (unreadable
+    /// file, or a tag the configured template needs is missing) — a Skip,
+    /// never a silent reclassification, same rationale as `DateUnavailable`.
+    AudioUnavailable(String),
+    /// `strategy = "video"` rendered a destination from this file's
+    /// container metadata.
+    VideoMatched(crate::config::VideoMetadata),
+    /// `strategy = "video"` could not safely obtain video metadata — a
+    /// Skip, never a silent reclassification, same rationale as
+    /// `DateUnavailable`.
+    VideoUnavailable(String),
+    /// `strategy = "photos"` rendered a destination from this file's EXIF
+    /// metadata.
+    PhotoMatched(crate::config::PhotoMetadata),
+    /// `strategy = "photos"` could not safely obtain EXIF metadata — a
+    /// Skip, never a silent reclassification, same rationale as
+    /// `DateUnavailable`.
+    PhotoUnavailable(String),
+    /// `strategy = "documents"` rendered a destination from this file's
+    /// document metadata.
+    DocumentMatched(crate::config::DocumentMetadata),
+    /// `strategy = "documents"` could not safely obtain document
+    /// metadata — a Skip, never a silent reclassification, same
+    /// rationale as `DateUnavailable`.
+    DocumentUnavailable(String),
 }
 
 /// Result of classifying a single entry for `organize`, before collision
@@ -307,6 +335,167 @@ pub(crate) fn classify_for_date(
     }
 }
 
+/// `strategy = "audio"`'s classification: the same categorical-safety and
+/// rule precedence every strategy shares, then tag metadata (read via
+/// `crate::metadata::extract_audio_metadata`, the one place this crate
+/// reads audio file content) rendered through the configured
+/// `MetadataTemplate`. A missing/unreadable file or a tag the template
+/// needs is a `Skip` with a clear reason — never a silently fabricated
+/// fallback like "Unknown Artist", same rationale as `classify_for_date`.
+pub(crate) fn classify_for_audio(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    template: &crate::config::MetadataTemplate,
+) -> Decision {
+    if let Some(d) = protected_decision(entry) {
+        return d;
+    }
+    if let Some(d) = rule_decision(entry, target, rules) {
+        return d;
+    }
+    let meta = match crate::metadata::extract_audio_metadata(&entry.path) {
+        Ok(m) => m,
+        Err(e) => {
+            return Decision::Skip(
+                format!("audio metadata unavailable: {e}"),
+                DecisionCause::AudioUnavailable(e),
+            )
+        }
+    };
+    match template.render_audio(&meta) {
+        Ok(rel_dir) => Decision::Move {
+            dest_dir: target.join(&rel_dir),
+            reason: format!(
+                "{}/{}",
+                meta.artist.as_deref().unwrap_or("?"),
+                meta.album.as_deref().unwrap_or("?")
+            ),
+            cause: DecisionCause::AudioMatched(meta),
+        },
+        Err(e) => Decision::Skip(
+            format!("audio metadata unavailable: {e}"),
+            DecisionCause::AudioUnavailable(e),
+        ),
+    }
+}
+
+/// `strategy = "video"`'s classification: the video counterpart to
+/// `classify_for_audio`, reading container metadata via
+/// `crate::metadata::extract_video_metadata` instead of tags.
+pub(crate) fn classify_for_video(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    template: &crate::config::MetadataTemplate,
+) -> Decision {
+    if let Some(d) = protected_decision(entry) {
+        return d;
+    }
+    if let Some(d) = rule_decision(entry, target, rules) {
+        return d;
+    }
+    let meta = match crate::metadata::extract_video_metadata(&entry.path) {
+        Ok(m) => m,
+        Err(e) => {
+            return Decision::Skip(
+                format!("video metadata unavailable: {e}"),
+                DecisionCause::VideoUnavailable(e),
+            )
+        }
+    };
+    match template.render_video(&meta) {
+        Ok(rel_dir) => Decision::Move {
+            dest_dir: target.join(&rel_dir),
+            reason: format!("{}x{}", meta.width, meta.height),
+            cause: DecisionCause::VideoMatched(meta),
+        },
+        Err(e) => Decision::Skip(
+            format!("video metadata unavailable: {e}"),
+            DecisionCause::VideoUnavailable(e),
+        ),
+    }
+}
+
+/// `strategy = "photos"`'s classification: the photos counterpart to
+/// `classify_for_audio`/`classify_for_video`, reading EXIF metadata via
+/// `crate::metadata::extract_photo_metadata` instead of tags/container
+/// info.
+pub(crate) fn classify_for_photos(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    template: &crate::config::MetadataTemplate,
+) -> Decision {
+    if let Some(d) = protected_decision(entry) {
+        return d;
+    }
+    if let Some(d) = rule_decision(entry, target, rules) {
+        return d;
+    }
+    let meta = match crate::metadata::extract_photo_metadata(&entry.path) {
+        Ok(m) => m,
+        Err(e) => {
+            return Decision::Skip(
+                format!("photo metadata unavailable: {e}"),
+                DecisionCause::PhotoUnavailable(e),
+            )
+        }
+    };
+    match template.render_photos(&meta) {
+        Ok(rel_dir) => Decision::Move {
+            dest_dir: target.join(&rel_dir),
+            reason: meta.camera.clone().unwrap_or_else(|| "photo".to_string()),
+            cause: DecisionCause::PhotoMatched(meta),
+        },
+        Err(e) => Decision::Skip(
+            format!("photo metadata unavailable: {e}"),
+            DecisionCause::PhotoUnavailable(e),
+        ),
+    }
+}
+
+/// `strategy = "documents"`'s classification: the documents counterpart
+/// to `classify_for_audio`/`classify_for_video`/`classify_for_photos`,
+/// reading PDF/Office metadata via
+/// `crate::metadata::extract_document_metadata`.
+pub(crate) fn classify_for_documents(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    template: &crate::config::MetadataTemplate,
+) -> Decision {
+    if let Some(d) = protected_decision(entry) {
+        return d;
+    }
+    if let Some(d) = rule_decision(entry, target, rules) {
+        return d;
+    }
+    let meta = match crate::metadata::extract_document_metadata(&entry.path) {
+        Ok(m) => m,
+        Err(e) => {
+            return Decision::Skip(
+                format!("document metadata unavailable: {e}"),
+                DecisionCause::DocumentUnavailable(e),
+            )
+        }
+    };
+    match template.render_documents(&meta) {
+        Ok(rel_dir) => Decision::Move {
+            dest_dir: target.join(&rel_dir),
+            reason: meta
+                .author
+                .clone()
+                .unwrap_or_else(|| "document".to_string()),
+            cause: DecisionCause::DocumentMatched(meta),
+        },
+        Err(e) => Decision::Skip(
+            format!("document metadata unavailable: {e}"),
+            DecisionCause::DocumentUnavailable(e),
+        ),
+    }
+}
+
 /// Resolves one entry's final action, checking real filesystem collisions
 /// and recording any directory that still needs `Op::CreateDir`.
 fn resolve_organize_action(
@@ -473,6 +662,147 @@ fn resolve_date_action(
     }
 }
 
+/// Resolves one entry's final Audio action — identical collision/no-
+/// overwrite/multi-level-`CreateDir` shape as `resolve_date_action`, just
+/// dispatched through `classify_for_audio`.
+fn resolve_audio_action(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    template: &crate::config::MetadataTemplate,
+    needed_dirs: &mut BTreeSet<PathBuf>,
+) -> Action {
+    resolve_metadata_action(
+        entry,
+        target,
+        needed_dirs,
+        classify_for_audio(entry, target, rules, template),
+    )
+}
+
+/// Resolves one entry's final Video action — the video counterpart to
+/// `resolve_audio_action`.
+fn resolve_video_action(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    template: &crate::config::MetadataTemplate,
+    needed_dirs: &mut BTreeSet<PathBuf>,
+) -> Action {
+    resolve_metadata_action(
+        entry,
+        target,
+        needed_dirs,
+        classify_for_video(entry, target, rules, template),
+    )
+}
+
+/// Resolves one entry's final Photos action — the photos counterpart to
+/// `resolve_audio_action`/`resolve_video_action`.
+fn resolve_photo_action(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    template: &crate::config::MetadataTemplate,
+    needed_dirs: &mut BTreeSet<PathBuf>,
+) -> Action {
+    resolve_metadata_action(
+        entry,
+        target,
+        needed_dirs,
+        classify_for_photos(entry, target, rules, template),
+    )
+}
+
+/// Resolves one entry's final Documents action — the documents
+/// counterpart to `resolve_audio_action`/`resolve_video_action`/
+/// `resolve_photo_action`.
+fn resolve_document_action(
+    entry: &Entry,
+    target: &Path,
+    rules: &[&Rule],
+    template: &crate::config::MetadataTemplate,
+    needed_dirs: &mut BTreeSet<PathBuf>,
+) -> Action {
+    resolve_metadata_action(
+        entry,
+        target,
+        needed_dirs,
+        classify_for_documents(entry, target, rules, template),
+    )
+}
+
+/// Shared by `resolve_audio_action`/`resolve_video_action`: turns an
+/// already-computed `Decision` into a final `Action`, with the same
+/// collision/no-overwrite/multi-level-`CreateDir` handling
+/// `resolve_date_action` uses (both strategies can render a
+/// multi-component destination, e.g. `{artist}/{album}`).
+fn resolve_metadata_action(
+    entry: &Entry,
+    target: &Path,
+    needed_dirs: &mut BTreeSet<PathBuf>,
+    decision: Decision,
+) -> Action {
+    let skip = |reason: &str| Action {
+        src: entry.path.clone(),
+        dst: None,
+        op: Op::Skip,
+        reason: Some(reason.to_string()),
+        undoable: false,
+    };
+    let skip_with_intended_dst = |dest: PathBuf, reason: &str| Action {
+        src: entry.path.clone(),
+        dst: Some(dest),
+        op: Op::Skip,
+        reason: Some(reason.to_string()),
+        undoable: false,
+    };
+    match decision {
+        Decision::Skip(reason, _cause) => skip(&reason),
+        Decision::Trash(reason, _cause) => Action {
+            src: entry.path.clone(),
+            dst: None,
+            op: Op::Trash,
+            reason: Some(reason),
+            undoable: false,
+        },
+        Decision::Move {
+            dest_dir,
+            reason,
+            cause: _,
+        } => {
+            let Some(levels) = destination_levels(target, &dest_dir) else {
+                return skip("destination escaped target");
+            };
+            let mut to_create = Vec::new();
+            for level in &levels {
+                match dir_status(level) {
+                    DirStatus::Blocked => return skip_with_intended_dst(dest_dir, "collision"),
+                    DirStatus::Missing => to_create.push(level.clone()),
+                    DirStatus::Exists => {}
+                }
+            }
+            let Some(filename) = entry.path.file_name() else {
+                return skip("entry has no file name");
+            };
+            let dest = dest_dir.join(filename);
+            if std::fs::symlink_metadata(&dest).is_ok() {
+                return skip_with_intended_dst(dest, "collision");
+            }
+            for dir in to_create {
+                needed_dirs.insert(dir);
+            }
+            Action {
+                src: entry.path.clone(),
+                dst: Some(dest),
+                op: Op::Move,
+                reason: Some(reason),
+                undoable: true,
+            }
+        }
+    }
+}
+
 /// One entry's organize plan: the `CreateDir` action(s) its destination
 /// needs (zero, one for `type`, or several in shallow-to-deep order for
 /// `date`), and the entry's own action.
@@ -544,6 +874,76 @@ pub fn plan_entry_date(
     }
 }
 
+/// The `audio`-strategy counterpart to `plan_entry_organize`/
+/// `plan_entry_date`, used by Watch through `plan_entry_with_strategy` the
+/// same way. `strategy = "audio"` never supports `--recursive`/recursive
+/// watch (see `OrganizeStrategy`'s doc comment) — that restriction is
+/// enforced before Watch ever reaches per-candidate planning, not here.
+pub fn plan_entry_audio(
+    entry: &Entry,
+    containing_dir: &Path,
+    config_rules: &[Rule],
+    template: &crate::config::MetadataTemplate,
+) -> EntryPlan {
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let action = resolve_audio_action(entry, containing_dir, &rules, template, &mut needed_dirs);
+    EntryPlan {
+        create_dirs: createdir_actions(needed_dirs),
+        action,
+    }
+}
+
+/// The `video`-strategy counterpart to `plan_entry_audio`.
+pub fn plan_entry_video(
+    entry: &Entry,
+    containing_dir: &Path,
+    config_rules: &[Rule],
+    template: &crate::config::MetadataTemplate,
+) -> EntryPlan {
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let action = resolve_video_action(entry, containing_dir, &rules, template, &mut needed_dirs);
+    EntryPlan {
+        create_dirs: createdir_actions(needed_dirs),
+        action,
+    }
+}
+
+/// The `photos`-strategy counterpart to `plan_entry_audio`/
+/// `plan_entry_video`.
+pub fn plan_entry_photos(
+    entry: &Entry,
+    containing_dir: &Path,
+    config_rules: &[Rule],
+    template: &crate::config::MetadataTemplate,
+) -> EntryPlan {
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let action = resolve_photo_action(entry, containing_dir, &rules, template, &mut needed_dirs);
+    EntryPlan {
+        create_dirs: createdir_actions(needed_dirs),
+        action,
+    }
+}
+
+/// The `documents`-strategy counterpart to `plan_entry_audio`/
+/// `plan_entry_video`/`plan_entry_photos`.
+pub fn plan_entry_documents(
+    entry: &Entry,
+    containing_dir: &Path,
+    config_rules: &[Rule],
+    template: &crate::config::MetadataTemplate,
+) -> EntryPlan {
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let action = resolve_document_action(entry, containing_dir, &rules, template, &mut needed_dirs);
+    EntryPlan {
+        create_dirs: createdir_actions(needed_dirs),
+        action,
+    }
+}
+
 /// Watch's sole authority for turning one live candidate into a plan,
 /// dispatching on the resolved policy's strategy the same way manual
 /// organize does — see `plan_with_strategy`. This is the one seam a
@@ -574,6 +974,42 @@ pub fn plan_entry_with_strategy(
             policy
                 .date_source
                 .expect("validated: Date always has a date_source"),
+        ),
+        OrganizeStrategy::Audio => plan_entry_audio(
+            entry,
+            containing_dir,
+            &policy.rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Audio always has a metadata_template"),
+        ),
+        OrganizeStrategy::Video => plan_entry_video(
+            entry,
+            containing_dir,
+            &policy.rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Video always has a metadata_template"),
+        ),
+        OrganizeStrategy::Photos => plan_entry_photos(
+            entry,
+            containing_dir,
+            &policy.rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Photos always has a metadata_template"),
+        ),
+        OrganizeStrategy::Documents => plan_entry_documents(
+            entry,
+            containing_dir,
+            &policy.rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Documents always has a metadata_template"),
         ),
     }
 }
@@ -647,6 +1083,102 @@ pub fn plan_organize_date(
     Plan { actions }
 }
 
+/// The `audio`-strategy counterpart to `plan_organize_date`: a
+/// non-recursive, single-directory organize (`strategy = "audio"` never
+/// supports `--recursive` — see `OrganizeStrategy`'s doc comment).
+pub fn plan_organize_audio(
+    path: &str,
+    config_rules: &[Rule],
+    template: &crate::config::MetadataTemplate,
+) -> Plan {
+    let target = Path::new(path);
+    let entries = scan_entries(target);
+    if is_project_root(target) {
+        return skip_all(&entries, "target is a software project root");
+    }
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let entry_actions: Vec<Action> = entries
+        .iter()
+        .map(|entry| resolve_audio_action(entry, target, &rules, template, &mut needed_dirs))
+        .collect();
+    let mut actions = createdir_actions(needed_dirs);
+    actions.extend(entry_actions);
+    Plan { actions }
+}
+
+/// The `video`-strategy counterpart to `plan_organize_audio`.
+pub fn plan_organize_video(
+    path: &str,
+    config_rules: &[Rule],
+    template: &crate::config::MetadataTemplate,
+) -> Plan {
+    let target = Path::new(path);
+    let entries = scan_entries(target);
+    if is_project_root(target) {
+        return skip_all(&entries, "target is a software project root");
+    }
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let entry_actions: Vec<Action> = entries
+        .iter()
+        .map(|entry| resolve_video_action(entry, target, &rules, template, &mut needed_dirs))
+        .collect();
+    let mut actions = createdir_actions(needed_dirs);
+    actions.extend(entry_actions);
+    Plan { actions }
+}
+
+/// The `photos`-strategy counterpart to `plan_organize_audio`/
+/// `plan_organize_video`: a non-recursive, single-directory organize
+/// (`strategy = "photos"` never supports `--recursive` — see
+/// `OrganizeStrategy`'s doc comment).
+pub fn plan_organize_photos(
+    path: &str,
+    config_rules: &[Rule],
+    template: &crate::config::MetadataTemplate,
+) -> Plan {
+    let target = Path::new(path);
+    let entries = scan_entries(target);
+    if is_project_root(target) {
+        return skip_all(&entries, "target is a software project root");
+    }
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let entry_actions: Vec<Action> = entries
+        .iter()
+        .map(|entry| resolve_photo_action(entry, target, &rules, template, &mut needed_dirs))
+        .collect();
+    let mut actions = createdir_actions(needed_dirs);
+    actions.extend(entry_actions);
+    Plan { actions }
+}
+
+/// The `documents`-strategy counterpart to `plan_organize_audio`/
+/// `plan_organize_video`/`plan_organize_photos`: a non-recursive,
+/// single-directory organize (`strategy = "documents"` never supports
+/// `--recursive` — see `OrganizeStrategy`'s doc comment).
+pub fn plan_organize_documents(
+    path: &str,
+    config_rules: &[Rule],
+    template: &crate::config::MetadataTemplate,
+) -> Plan {
+    let target = Path::new(path);
+    let entries = scan_entries(target);
+    if is_project_root(target) {
+        return skip_all(&entries, "target is a software project root");
+    }
+    let rules = rules_by_priority(config_rules);
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let entry_actions: Vec<Action> = entries
+        .iter()
+        .map(|entry| resolve_document_action(entry, target, &rules, template, &mut needed_dirs))
+        .collect();
+    let mut actions = createdir_actions(needed_dirs);
+    actions.extend(entry_actions);
+    Plan { actions }
+}
+
 /// The single "policy → strategy → planner" dispatch point for a
 /// non-recursive organize. `policy` is always already validated (see
 /// `config::resolve_policy`) by the time it reaches here, so this match is
@@ -667,6 +1199,38 @@ pub fn plan_with_strategy(path: &str, policy: &EffectivePolicy, builtin: &Catego
             policy
                 .date_source
                 .expect("validated: Date always has a date_source"),
+        ),
+        OrganizeStrategy::Audio => plan_organize_audio(
+            path,
+            &policy.rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Audio always has a metadata_template"),
+        ),
+        OrganizeStrategy::Video => plan_organize_video(
+            path,
+            &policy.rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Video always has a metadata_template"),
+        ),
+        OrganizeStrategy::Photos => plan_organize_photos(
+            path,
+            &policy.rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Photos always has a metadata_template"),
+        ),
+        OrganizeStrategy::Documents => plan_organize_documents(
+            path,
+            &policy.rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Documents always has a metadata_template"),
         ),
     }
 }
@@ -885,6 +1449,21 @@ pub fn plan_with_strategy_recursive(
                 .date_source
                 .expect("validated: Date always has a date_source"),
         ),
+        // `Audio`/`Video`/`Photos`/`Documents` never support `--recursive`
+        // (see `OrganizeStrategy::supports_recursive`) — `cmd_organize`
+        // already refuses to call this function for them, but this arm is
+        // defense in depth for any other caller, producing a clear,
+        // harmless all-skip plan instead of organizing anything.
+        OrganizeStrategy::Audio
+        | OrganizeStrategy::Video
+        | OrganizeStrategy::Photos
+        | OrganizeStrategy::Documents => RecursivePlan {
+            plan: skip_all(
+                &scan_entries(Path::new(path)),
+                "strategy does not support --recursive",
+            ),
+            dirs_scanned: 0,
+        },
     }
 }
 
@@ -978,6 +1557,13 @@ pub fn cmd_organize(path: String, apply: bool, json: bool, verbose: bool, recurs
             return false;
         }
     };
+    if recursive && !policy.strategy.supports_recursive() {
+        eprintln!(
+            "strategy = \"{}\" does not support --recursive yet.",
+            policy.strategy.as_str()
+        );
+        return false;
+    }
     let builtins = CategoryDB::default();
     let root = is_project_root(Path::new(&path));
 

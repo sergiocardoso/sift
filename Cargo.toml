@@ -16,6 +16,12 @@ directories = "5.0"
 thiserror = "1.0"
 notify = "6"
 libc = "0.2.189"
+lofty = "0.25"
+mp4 = "0.14"
+kamadak-exif = "0.6.1"
+lopdf = { version = "0.45.0", default-features = false }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+roxmltree = "0.21.1"
 
 [dev-dependencies]
 tempfile = "3.0"

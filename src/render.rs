@@ -877,7 +877,11 @@ pub fn config_check_json(result: &Result<crate::config::EffectivePolicy, String>
             version: Some(p.version),
             strategy: Some(p.strategy.as_str().to_string()),
             unknown: Some(p.unknown_policy.as_str().to_string()),
-            template: p.template.as_ref().map(|t| t.raw().to_string()),
+            template: p
+                .template
+                .as_ref()
+                .map(|t| t.raw().to_string())
+                .or_else(|| p.metadata_template.as_ref().map(|t| t.raw().to_string())),
             date_source: p.date_source.map(|d| d.as_str().to_string()),
             stability_seconds: Some(p.stability.as_secs()),
             rules: Some(p.rules.len()),
@@ -937,6 +941,22 @@ pub fn config_check(path: &str, result: &Result<crate::config::EffectivePolicy, 
                             .expect("validated: Date always has a template")
                             .raw()
                     );
+                }
+                OrganizeStrategy::Audio
+                | OrganizeStrategy::Video
+                | OrganizeStrategy::Photos
+                | OrganizeStrategy::Documents => {
+                    println!(
+                        "  template     {}",
+                        policy
+                            .metadata_template
+                            .as_ref()
+                            .expect(
+                                "validated: Audio/Video/Photos/Documents always has a metadata_template"
+                            )
+                            .raw()
+                    );
+                    println!("  recursive    not supported yet");
                 }
             }
             println!();
@@ -1050,6 +1070,129 @@ pub fn explain(exp: &crate::explain::Explanation) {
                         println!("  year         {:04}", meta.year);
                         println!("  month        {:02}", meta.month);
                         println!("  day          {:02}", meta.day);
+                    }
+                    None => println!("  unavailable"),
+                }
+                println!();
+                println!("Template");
+                println!("  {}", exp.template.as_deref().unwrap_or("(none)"));
+            }
+            OrganizeStrategy::Audio => {
+                println!("Metadata");
+                match &exp.audio_metadata {
+                    Some(meta) => {
+                        println!(
+                            "  title        {}",
+                            meta.title.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  artist       {}",
+                            meta.artist.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  album        {}",
+                            meta.album.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  album artist {}",
+                            meta.album_artist.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  genre        {}",
+                            meta.genre.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  year         {}",
+                            meta.year.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  track        {}",
+                            meta.track.as_deref().unwrap_or("(none)")
+                        );
+                    }
+                    None => println!("  unavailable"),
+                }
+                println!();
+                println!("Template");
+                println!("  {}", exp.template.as_deref().unwrap_or("(none)"));
+            }
+            OrganizeStrategy::Video => {
+                println!("Metadata");
+                match &exp.video_metadata {
+                    Some(meta) => {
+                        println!("  resolution   {}x{}", meta.width, meta.height);
+                        println!(
+                            "  codec        {}",
+                            meta.codec.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  year         {}",
+                            meta.year.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  duration     {}",
+                            meta.duration_seconds
+                                .map(|d| format!("{d}s"))
+                                .unwrap_or_else(|| "(none, requires ffprobe)".to_string())
+                        );
+                        println!(
+                            "  fps          {}",
+                            meta.fps
+                                .map(|f| f.to_string())
+                                .unwrap_or_else(|| "(none, requires ffprobe)".to_string())
+                        );
+                    }
+                    None => println!("  unavailable"),
+                }
+                println!();
+                println!("Template");
+                println!("  {}", exp.template.as_deref().unwrap_or("(none)"));
+            }
+            OrganizeStrategy::Photos => {
+                println!("Metadata");
+                match &exp.photo_metadata {
+                    Some(meta) => {
+                        println!(
+                            "  camera       {}",
+                            meta.camera.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  year         {}",
+                            meta.year.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  month        {}",
+                            meta.month.as_deref().unwrap_or("(none)")
+                        );
+                        println!("  day          {}", meta.day.as_deref().unwrap_or("(none)"));
+                    }
+                    None => println!("  unavailable"),
+                }
+                println!();
+                println!("Template");
+                println!("  {}", exp.template.as_deref().unwrap_or("(none)"));
+            }
+            OrganizeStrategy::Documents => {
+                println!("Metadata");
+                match &exp.document_metadata {
+                    Some(meta) => {
+                        println!(
+                            "  author       {}",
+                            meta.author.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  title        {}",
+                            meta.title.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  year         {}",
+                            meta.year.as_deref().unwrap_or("(none)")
+                        );
+                        println!(
+                            "  month        {}",
+                            meta.month.as_deref().unwrap_or("(none)")
+                        );
+                        println!("  day          {}", meta.day.as_deref().unwrap_or("(none)"));
                     }
                     None => println!("  unavailable"),
                 }

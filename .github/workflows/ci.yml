@@ -16,6 +16,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Lets the `strategy = "video"` ffprobe-backend tests exercise the
+      # real path in CI instead of silently only ever hitting the
+      # pure-Rust fallback (ffprobe is optional at runtime, but CI should
+      # still cover both backends every run).
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Format check
         run: cargo fmt --check
       - name: Clippy

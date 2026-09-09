@@ -154,7 +154,19 @@ impl Daemon {
     /// never later "become ready" once the policy is fixed — no backfill,
     /// ever, by construction) and records the error on the registry entry
     /// for `sift watch status`; a transition back to valid clears it.
-    fn refresh_policy(&mut self, root: &Path) -> Result<EffectivePolicy, String> {
+    ///
+    /// `recursive` is this root's registered watch mode — a property of
+    /// the watch registration, not of `.sift.toml` itself, so it's applied
+    /// *after* the mtime-cached `resolve_policy` result (which is cached
+    /// purely on config content) rather than folded into the cache. If
+    /// `recursive` is true but the resolved strategy doesn't support it
+    /// (`audio`/`video` — see `OrganizeStrategy::supports_recursive`),
+    /// that's treated exactly like a broken config: fail-closed, via the
+    /// same `unhealthy`/`set_config_health` path below. This is what
+    /// catches a hot-reloaded `.sift.toml` that switches a
+    /// already-recursive watch to `strategy = "audio"` after the fact —
+    /// `cmd_watch_add` only catches this combination at registration time.
+    fn refresh_policy(&mut self, root: &Path, recursive: bool) -> Result<EffectivePolicy, String> {
         let local_path = root.join(".sift.toml");
         let current_mtime = fs::metadata(&local_path).and_then(|m| m.modified()).ok();
 
@@ -172,6 +184,16 @@ impl Daemon {
             );
             resolved
         };
+        let resolved = resolved.and_then(|policy| {
+            if recursive && !policy.strategy.supports_recursive() {
+                Err(format!(
+                    "strategy = \"{}\" does not support recursive watch",
+                    policy.strategy.as_str()
+                ))
+            } else {
+                Ok(policy)
+            }
+        });
 
         match &resolved {
             Ok(_) => {
@@ -251,7 +273,7 @@ impl Daemon {
             // (mtime-cached), and this is what makes hot reload and
             // fail-closed suspension work without any separate polling
             // mechanism for `.sift.toml` itself.
-            let _ = self.refresh_policy(path);
+            let _ = self.refresh_policy(path, *recursive);
         }
     }
 

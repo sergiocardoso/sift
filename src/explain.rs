@@ -11,12 +11,14 @@
 
 use crate::classifier::CategoryDB;
 use crate::config::{
-    rules_by_priority, DateMetadata, EffectivePolicy, OrganizeStrategy, PolicySource,
+    rules_by_priority, AudioMetadata, DateMetadata, DocumentMetadata, EffectivePolicy,
+    OrganizeStrategy, PhotoMetadata, PolicySource, VideoMetadata,
 };
 use crate::domain::{Category, Op};
 use crate::fs::ancestors_are_safe;
 use crate::planner::{
-    classify_for_date, classify_for_organize, destination_levels, dir_status, Decision,
+    classify_for_audio, classify_for_date, classify_for_documents, classify_for_organize,
+    classify_for_photos, classify_for_video, destination_levels, dir_status, Decision,
     DecisionCause, DirStatus,
 };
 use serde::Serialize;
@@ -35,9 +37,9 @@ pub struct Explanation {
     pub root: PathBuf,
     pub source: PolicySource,
     pub strategy: OrganizeStrategy,
-    /// The raw `organize.template` string, when `strategy = "date"` (for
-    /// display; not used for anything, since rendering already happened
-    /// inside `classify_for_date`).
+    /// The raw `organize.template` string, when `strategy` is `"date"`,
+    /// `"audio"`, or `"video"` (for display; not used for anything, since
+    /// rendering already happened inside `classify_for_*`).
     pub template: Option<String>,
     /// `Some((pattern, action, destination))` if an explicit `[[rules]]`
     /// entry is what decided this file.
@@ -52,6 +54,14 @@ pub struct Explanation {
     /// `Some` when `strategy = "date"` is what decided this file (rule
     /// wins and categorical protection both leave this `None`).
     pub date_metadata: Option<DateMetadata>,
+    /// `Some` when `strategy = "audio"` is what decided this file.
+    pub audio_metadata: Option<AudioMetadata>,
+    /// `Some` when `strategy = "video"` is what decided this file.
+    pub video_metadata: Option<VideoMetadata>,
+    /// `Some` when `strategy = "photos"` is what decided this file.
+    pub photo_metadata: Option<PhotoMetadata>,
+    /// `Some` when `strategy = "documents"` is what decided this file.
+    pub document_metadata: Option<DocumentMetadata>,
     pub op: Op,
     pub reason: String,
     pub destination: Option<PathBuf>,
@@ -67,6 +77,10 @@ struct DecisionCauseSummary {
     classification: Option<Category>,
     unknown_fallback: Option<crate::config::UnknownPolicy>,
     date_metadata: Option<DateMetadata>,
+    audio_metadata: Option<AudioMetadata>,
+    video_metadata: Option<VideoMetadata>,
+    photo_metadata: Option<PhotoMetadata>,
+    document_metadata: Option<DocumentMetadata>,
 }
 
 fn decision_cause_summary(cause: &DecisionCause) -> DecisionCauseSummary {
@@ -96,9 +110,28 @@ fn decision_cause_summary(cause: &DecisionCause) -> DecisionCauseSummary {
             date_metadata: Some(*date),
             ..Default::default()
         },
-        DecisionCause::Protected(_) | DecisionCause::DateUnavailable(_) => {
-            DecisionCauseSummary::default()
-        }
+        DecisionCause::AudioMatched(meta) => DecisionCauseSummary {
+            audio_metadata: Some(meta.clone()),
+            ..Default::default()
+        },
+        DecisionCause::VideoMatched(meta) => DecisionCauseSummary {
+            video_metadata: Some(meta.clone()),
+            ..Default::default()
+        },
+        DecisionCause::PhotoMatched(meta) => DecisionCauseSummary {
+            photo_metadata: Some(meta.clone()),
+            ..Default::default()
+        },
+        DecisionCause::DocumentMatched(meta) => DecisionCauseSummary {
+            document_metadata: Some(meta.clone()),
+            ..Default::default()
+        },
+        DecisionCause::Protected(_)
+        | DecisionCause::DateUnavailable(_)
+        | DecisionCause::AudioUnavailable(_)
+        | DecisionCause::VideoUnavailable(_)
+        | DecisionCause::PhotoUnavailable(_)
+        | DecisionCause::DocumentUnavailable(_) => DecisionCauseSummary::default(),
     }
 }
 
@@ -128,6 +161,42 @@ pub fn explain_path(file: &Path, root: &Path) -> Result<Explanation, String> {
                 .date_source
                 .expect("validated: Date always has a date_source"),
         ),
+        OrganizeStrategy::Audio => classify_for_audio(
+            &entry,
+            root,
+            &rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Audio always has a metadata_template"),
+        ),
+        OrganizeStrategy::Video => classify_for_video(
+            &entry,
+            root,
+            &rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Video always has a metadata_template"),
+        ),
+        OrganizeStrategy::Photos => classify_for_photos(
+            &entry,
+            root,
+            &rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Photos always has a metadata_template"),
+        ),
+        OrganizeStrategy::Documents => classify_for_documents(
+            &entry,
+            root,
+            &rules,
+            policy
+                .metadata_template
+                .as_ref()
+                .expect("validated: Documents always has a metadata_template"),
+        ),
     };
 
     let (mut op, mut reason, cause, dest_dir) = match decision {
@@ -140,11 +209,24 @@ pub fn explain_path(file: &Path, root: &Path) -> Result<Explanation, String> {
         } => (Op::Move, reason, cause, Some(dest_dir)),
     };
     let summary = decision_cause_summary(&cause);
-    let (matched_rule, classification, unknown_fallback, date_metadata) = (
+    let (
+        matched_rule,
+        classification,
+        unknown_fallback,
+        date_metadata,
+        audio_metadata,
+        video_metadata,
+        photo_metadata,
+        document_metadata,
+    ) = (
         summary.matched_rule,
         summary.classification,
         summary.unknown_fallback,
         summary.date_metadata,
+        summary.audio_metadata,
+        summary.video_metadata,
+        summary.photo_metadata,
+        summary.document_metadata,
     );
 
     let mut checks = vec![
@@ -168,12 +250,33 @@ pub fn explain_path(file: &Path, root: &Path) -> Result<Explanation, String> {
             },
         },
     ];
-    if let DecisionCause::DateUnavailable(msg) = &cause {
-        checks.push(SafetyCheck {
+    match &cause {
+        DecisionCause::DateUnavailable(msg) => checks.push(SafetyCheck {
             label: "date metadata available",
             ok: false,
             detail: Some(msg.clone()),
-        });
+        }),
+        DecisionCause::AudioUnavailable(msg) => checks.push(SafetyCheck {
+            label: "audio metadata available",
+            ok: false,
+            detail: Some(msg.clone()),
+        }),
+        DecisionCause::VideoUnavailable(msg) => checks.push(SafetyCheck {
+            label: "video metadata available",
+            ok: false,
+            detail: Some(msg.clone()),
+        }),
+        DecisionCause::PhotoUnavailable(msg) => checks.push(SafetyCheck {
+            label: "photo metadata available",
+            ok: false,
+            detail: Some(msg.clone()),
+        }),
+        DecisionCause::DocumentUnavailable(msg) => checks.push(SafetyCheck {
+            label: "document metadata available",
+            ok: false,
+            detail: Some(msg.clone()),
+        }),
+        _ => {}
     }
 
     let mut destination = None;
@@ -245,11 +348,24 @@ pub fn explain_path(file: &Path, root: &Path) -> Result<Explanation, String> {
         root: root.to_path_buf(),
         source: policy.source,
         strategy: policy.strategy,
-        template: policy.template.as_ref().map(|t| t.raw().to_string()),
+        template: policy
+            .template
+            .as_ref()
+            .map(|t| t.raw().to_string())
+            .or_else(|| {
+                policy
+                    .metadata_template
+                    .as_ref()
+                    .map(|t| t.raw().to_string())
+            }),
         matched_rule,
         classification,
         unknown_fallback,
         date_metadata,
+        audio_metadata,
+        video_metadata,
+        photo_metadata,
+        document_metadata,
         op,
         reason,
         destination,
