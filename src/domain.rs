@@ -14,7 +14,7 @@ pub struct Entry {
     pub classified_as: Option<Category>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Category {
     Document,
     Image,
@@ -53,7 +53,16 @@ pub struct Action {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
     CreateDir,
+    /// Moves a regular file. The executor requires the source to actually
+    /// be a plain file — never a directory. See `MoveDir` for moving a
+    /// whole directory; the two are never interchangeable.
     Move,
+    /// Moves an entire directory intact (used by `sift folders`). The
+    /// executor requires the source to actually be a directory — never a
+    /// regular file. Kept as its own variant specifically so `Move`'s
+    /// regular-file requirement is never loosened to "anything but a
+    /// symlink".
+    MoveDir,
     Trash,
     Skip,
 }

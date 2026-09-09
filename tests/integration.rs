@@ -1,4 +1,5 @@
 use sift::classifier::CategoryDB;
+use sift::config::UnknownPolicy;
 use sift::domain::{Category, Op};
 use sift::history::{clear_test_history_dir, set_test_history_dir};
 use sift::planner::{plan_clean, plan_organize};
@@ -32,7 +33,12 @@ fn test_collision_detection_broken_symlink() {
     File::create(t.join("foo.pdf")).unwrap();
     std::fs::create_dir_all(t.join("Documents")).unwrap();
     symlink("/nonexistent", t.join("Documents/foo.pdf")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let act = plan
         .actions
         .iter()
@@ -77,7 +83,12 @@ fn test_protected_project_root() {
     assert!(entries.iter().any(|e| e.path.ends_with("photo.jpg")));
 
     // ...but organize/clean must refuse to plan any mutation on the root itself.
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(!plan.actions.is_empty());
     assert!(plan.actions.iter().all(|a| a.op == Op::Skip));
     let clean_plan = plan_clean(t.to_str().unwrap(), &[], &CategoryDB::default());
@@ -93,7 +104,12 @@ fn test_organize_dry_run_no_mutation() {
     // Ensure test isolation from user history
     assert!(hist_dir.starts_with(t)); // Safety: tempdir path only in test
     File::create(t.join("photo.jpg")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(plan.actions.iter().any(|a| a.dst.is_some()));
     assert!(plan
         .actions
@@ -115,7 +131,12 @@ fn test_expected_organize_destinations() {
     assert!(hist_dir.starts_with(t)); // Safety: tempdir path only in test
     File::create(t.join("pic.png")).unwrap();
     File::create(t.join("song.mp3")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(plan.actions.iter().any(|a| a
         .dst
         .as_ref()
@@ -142,7 +163,12 @@ fn test_apply_move_and_undo() {
     let src = t.join("z.txt");
     let dst = t.join("Documents/z.txt");
     File::create(&src).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(plan
         .actions
         .iter()
@@ -171,7 +197,12 @@ fn test_collision_no_overwrite() {
     File::create(t.join("foo.pdf")).unwrap();
     std::fs::create_dir_all(t.join("Documents")).unwrap();
     File::create(t.join("Documents/foo.pdf")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let act = plan
         .actions
         .iter()
@@ -221,7 +252,12 @@ fn test_failed_move_recorded_accurately_in_history() {
 
     let src = t.join("race.txt");
     File::create(&src).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     // Simulate a TOCTOU race: the destination appears after planning but
     // before execution. The executor must revalidate immediately before
     // mutating, refuse to overwrite, and record the failure accurately
@@ -274,7 +310,12 @@ fn test_history_written() {
     let src = t.join("hist.txt");
     File::create(&src).unwrap();
     let dst = t.join("Documents/hist.txt");
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(plan
         .actions
         .iter()
@@ -291,6 +332,46 @@ fn test_history_written() {
     assert!(found);
 }
 
+/// Release-audit regression: a history record written before `kind`,
+/// `origin`, and `watch_root` existed on `HistoryItem` (and before
+/// `Op::MoveDir` existed on `Op`) must still deserialize and undo
+/// correctly. All three fields carry `#[serde(default)]` specifically for
+/// this; this test pins that guarantee down so it can never silently
+/// regress.
+#[test]
+fn test_legacy_history_record_without_newer_fields_deserializes_and_undoes() {
+    use sift::history::cmd_undo;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    let hist_dir = t.join(".sift-history");
+    set_test_history_dir(hist_dir.clone());
+    assert!(hist_dir.starts_with(t)); // Safety: tempdir path only in test
+
+    std::fs::create_dir_all(t.join("Documents")).unwrap();
+    File::create(t.join("Documents/old.txt")).unwrap();
+    std::fs::create_dir_all(&hist_dir).unwrap();
+    let src = t.join("old.txt");
+    let dst = t.join("Documents/old.txt");
+    let legacy_json = format!(
+        r#"{{
+  "id": "hist-legacy-1",
+  "actions": [
+    {{"src": {src:?}, "dst": {dst:?}, "op": "Move", "reason": "Document", "undoable": true}}
+  ],
+  "timestamp": 1700000000,
+  "outcomes": [
+    {{"src": {src:?}, "dst": {dst:?}, "op": "Move", "result": {{"Ok": null}}, "undoable": true}}
+  ]
+}}"#
+    );
+    std::fs::write(hist_dir.join("hist-legacy-1.json"), legacy_json).unwrap();
+
+    assert!(cmd_undo("hist-legacy-1".to_string()));
+    assert!(src.exists(), "legacy record's Move must be reversed");
+    assert!(!dst.exists());
+    clear_test_history_dir();
+}
+
 #[test]
 fn test_undo_refuses_occupied_original() {
     use sift::executor::execute_plan;
@@ -304,7 +385,12 @@ fn test_undo_refuses_occupied_original() {
     let src = t.join("x.txt");
     let dst = t.join("Documents/x.txt");
     File::create(&src).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(plan
         .actions
         .iter()
@@ -368,7 +454,12 @@ fn test_config_skip_rule_honored_without_destination() {
     let t = d.path();
     File::create(t.join("abc.txt")).unwrap();
     let rules = vec![make_rule("skip txt", "*.txt", "Skip", None)];
-    let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &rules,
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let skip = plan
         .actions
         .iter()
@@ -384,7 +475,12 @@ fn test_config_trash_rule_honored_without_destination() {
     let t = d.path();
     File::create(t.join("abc.txt")).unwrap();
     let rules = vec![make_rule("trash txt", "*.txt", "Trash", None)];
-    let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &rules,
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let trash = plan
         .actions
         .iter()
@@ -400,7 +496,12 @@ fn test_config_safe_move_rule_honored() {
     let t = d.path();
     File::create(t.join("abc.txt")).unwrap();
     let rules = vec![make_rule("move txt", "*.txt", "Move", Some("Stuff"))];
-    let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &rules,
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let mv = plan
         .actions
         .iter()
@@ -421,7 +522,12 @@ fn test_config_unsafe_destination_rejected() {
     File::create(t.join("abc.txt")).unwrap();
     for bad_dest in ["/etc", "../escape", "..", "a/../../escape", ""] {
         let rules = vec![make_rule("bad move", "*.txt", "Move", Some(bad_dest))];
-        let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+        let plan = plan_organize(
+            t.to_str().unwrap(),
+            &rules,
+            &CategoryDB::default(),
+            UnknownPolicy::Other,
+        );
         let act = plan
             .actions
             .iter()
@@ -447,7 +553,12 @@ fn test_config_rule_priority_highest_wins() {
     low.priority = 1;
     let mut high = make_rule("high priority trash", "*.txt", "Trash", None);
     high.priority = 10;
-    let plan = plan_organize(t.to_str().unwrap(), &[low, high], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[low, high],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let act = plan
         .actions
         .iter()
@@ -471,7 +582,12 @@ fn test_hidden_files_protected() {
         .find(|e| e.path.ends_with(".hidden.txt"))
         .unwrap();
     assert!(hidden.hidden);
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let act = plan
         .actions
         .iter()
@@ -542,7 +658,12 @@ fn test_undo_does_not_rewrite_original_history_record() {
     let src = t.join("orig.txt");
     let dst = t.join("Documents/orig.txt");
     File::create(&src).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(dst.exists());
 
@@ -605,18 +726,31 @@ fn test_no_implicit_apply_behavior() {
         Some(Commands::Organize { apply, .. }) => assert!(!apply),
         _ => panic!("expected Organize command"),
     }
-    // There is no config mechanism to enable mutation implicitly in v0.1:
-    // plan_organize never touches the filesystem regardless of config, and
-    // even a stray/foreign `[general] apply_by_default = true` table in a
-    // config file (e.g. left over from an old version) is inert and safely
-    // ignored rather than parsed into anything that could trigger mutation.
+}
+
+// Backward-compatibility migration note: earlier versions of this test
+// wrote a stray/foreign `[general] apply_by_default = true` table into a
+// local `.sift.toml` and asserted that `load_config` parsed it anyway
+// (unknown fields silently ignored), then that organize still never
+// mutated. Under v1 strict validation, an unrecognized table is instead a
+// clear config error (config mistakes must be visible, never silently
+// swallowed) — so the real invariant this test protects ("no config
+// mechanism, valid or broken, can cause an implicit mutation") now shows
+// up as: an invalid local config makes organize refuse to run at all,
+// rather than falling back to defaults and mutating anyway.
+#[test]
+fn test_invalid_local_config_refuses_to_run_never_falls_back() {
     let d = tempdir().unwrap();
     let t = d.path();
     File::create(t.join("photo.jpg")).unwrap();
     std::fs::write(t.join(".sift.toml"), "[general]\napply_by_default = true\n").unwrap();
-    let cfg_path = sift::config::find_config(t.to_str().unwrap()).unwrap();
-    let config = sift::config::load_config(&cfg_path).unwrap();
-    let _ = plan_organize(t.to_str().unwrap(), &config.rules, &CategoryDB::default());
+    assert!(sift::config::resolve_policy(t.to_str().unwrap()).is_err());
+
+    // Even asking for --apply must not mutate anything: resolution fails
+    // before any plan is ever built.
+    let ok =
+        sift::planner::cmd_organize(t.to_str().unwrap().to_string(), true, false, false, false);
+    assert!(!ok);
     assert!(std::fs::metadata(t.join("photo.jpg")).is_ok());
     assert!(std::fs::metadata(t.join("Images")).is_err());
 }
@@ -635,7 +769,12 @@ fn test_undo_refuses_when_destination_replaced_by_directory() {
     let src = t.join("doc.txt");
     let dst = t.join("Documents/doc.txt");
     File::create(&src).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(plan
         .actions
         .iter()
@@ -718,7 +857,12 @@ fn test_config_move_destination_symlink_escape_rejected() {
     symlink(outside.path(), t.join("Stuff")).unwrap();
 
     let rules = vec![make_rule("escape", "*.txt", "Move", Some("Stuff"))];
-    let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &rules,
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     // Planning must never emit a CreateDir/Move that would create or write
     // through the symlink.
     assert!(!plan.actions.iter().any(|a| a.op == Op::CreateDir));
@@ -787,7 +931,12 @@ fn test_non_recursive_organize_ignores_nested_files() {
     std::fs::create_dir_all(t.join("nested")).unwrap();
     File::create(t.join("nested/nested.jpg")).unwrap();
 
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(
         !plan
             .actions
@@ -817,7 +966,12 @@ fn test_recursive_organize_treats_each_directory_locally() {
     std::fs::create_dir_all(t.join("nested")).unwrap();
     File::create(t.join("nested/nested.jpg")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let root_move = rp
         .plan
         .actions
@@ -860,7 +1014,12 @@ fn test_recursive_organize_dry_run_no_mutation() {
     std::fs::create_dir_all(t.join("nested")).unwrap();
     File::create(t.join("nested/nested.jpg")).unwrap();
 
-    let _ = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let _ = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(t.join("root.pdf").exists());
     assert!(t.join("nested/nested.jpg").exists());
     assert!(!t.join("Documents").exists());
@@ -881,7 +1040,12 @@ fn test_recursive_organize_apply_moves_nested_files() {
     std::fs::create_dir_all(t.join("nested")).unwrap();
     File::create(t.join("nested/nested.jpg")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let (_id, outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
     assert!(outcomes.iter().all(|o| o.result.is_ok()));
 
@@ -901,7 +1065,12 @@ fn test_recursive_organize_explicit_createdir_per_directory() {
     std::fs::create_dir_all(t.join("nested")).unwrap();
     File::create(t.join("nested/nested.jpg")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(rp
         .plan
         .actions
@@ -922,7 +1091,12 @@ fn test_recursive_organize_does_not_reprocess_category_dirs() {
     std::fs::create_dir_all(t.join("Documents")).unwrap();
     File::create(t.join("Documents/existing.pdf")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(
         !rp.plan
             .actions
@@ -1026,7 +1200,12 @@ fn test_recursive_discovery_stops_at_nested_project_root() {
     );
 
     // The organize plan must never touch anything inside the nested project.
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(!rp
         .plan
         .actions
@@ -1067,7 +1246,12 @@ fn test_recursive_organize_collision_in_nested_dir() {
     File::create(t.join("nested/Documents/report.pdf")).unwrap();
     File::create(t.join("nested/report.pdf")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let action = rp
         .plan
         .actions
@@ -1088,7 +1272,12 @@ fn test_recursive_organize_broken_symlink_collision_in_nested_dir() {
     symlink("/nonexistent", t.join("nested/Documents/report.pdf")).unwrap();
     File::create(t.join("nested/report.pdf")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let action = rp
         .plan
         .actions
@@ -1113,7 +1302,12 @@ fn test_recursive_executor_toctou_collision_in_nested_dir() {
     std::fs::create_dir_all(t.join("nested")).unwrap();
     let src = t.join("nested/race.txt");
     File::create(&src).unwrap();
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
 
     // Race: the destination appears after planning but before execution.
     std::fs::create_dir_all(t.join("nested/Documents")).unwrap();
@@ -1189,7 +1383,12 @@ fn test_recursive_history_records_one_operation() {
     std::fs::create_dir_all(t.join("nested")).unwrap();
     File::create(t.join("nested/nested.jpg")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let (id, _outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
 
     let files: Vec<_> = std::fs::read_dir(&hist_dir).unwrap().flatten().collect();
@@ -1220,7 +1419,12 @@ fn test_recursive_undo_restores_nested_files() {
     std::fs::create_dir_all(t.join("nested")).unwrap();
     File::create(t.join("nested/nested.jpg")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let (id, _outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
     assert!(t.join("Documents/root.pdf").exists());
     assert!(t.join("nested/Images/nested.jpg").exists());
@@ -1338,7 +1542,12 @@ fn test_new_categories_and_fallback_classification() {
     File::create(t.join("arquivo-desconhecido.xyz")).unwrap();
     File::create(t.join("README")).unwrap(); // no extension at all
 
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
 
     let expect_dir = |name: &str, dir: &str| {
         let a = move_dest(&plan, name);
@@ -1364,7 +1573,12 @@ fn test_unclassified_no_longer_means_skip() {
     let d = tempdir().unwrap();
     let t = d.path();
     File::create(t.join("mystery.xyz")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, "mystery.xyz");
     assert_eq!(
         a.op,
@@ -1382,7 +1596,12 @@ fn test_hidden_unknown_file_still_skipped() {
     let d = tempdir().unwrap();
     let t = d.path();
     File::create(t.join(".hidden.xyz")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, ".hidden.xyz");
     assert_eq!(a.op, Op::Skip);
     assert_eq!(a.reason.as_deref(), Some("hidden file"));
@@ -1396,7 +1615,12 @@ fn test_symlink_unknown_file_still_skipped() {
     let target = t.join("real.xyz");
     File::create(&target).unwrap();
     symlink(&target, t.join("link.xyz")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, "link.xyz");
     assert_eq!(a.op, Op::Skip);
     assert_eq!(a.reason.as_deref(), Some("symlink"));
@@ -1408,7 +1632,12 @@ fn test_broken_symlink_unknown_extension_still_skipped() {
     let d = tempdir().unwrap();
     let t = d.path();
     symlink("/nonexistent-xyz", t.join("dangling.xyz")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, "dangling.xyz");
     assert_eq!(a.op, Op::Skip);
     assert_eq!(a.reason.as_deref(), Some("symlink"));
@@ -1421,7 +1650,12 @@ fn test_protected_directory_never_gets_other_fallback() {
     // A directory whose *name* looks like a file extension must still be
     // treated as a directory, never classified/moved into Other/.
     std::fs::create_dir_all(t.join("weird.xyz")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, "weird.xyz");
     assert_eq!(a.op, Op::Skip);
     assert_eq!(a.reason.as_deref(), Some("directory"));
@@ -1437,7 +1671,12 @@ fn test_project_root_subtree_never_extracted_into_other() {
     File::create(t.join("my-app/src/index.js")).unwrap();
     File::create(t.join("my-app/notes.xyz")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(
         !rp.plan
             .actions
@@ -1462,7 +1701,12 @@ fn test_config_skip_overrides_builtin_data_category() {
     let t = d.path();
     File::create(t.join("keep.json")).unwrap();
     let rules = vec![make_rule("skip json", "*.json", "Skip", None)];
-    let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &rules,
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, "keep.json");
     assert_eq!(
         a.op,
@@ -1477,7 +1721,12 @@ fn test_config_move_overrides_builtin_code_category() {
     let t = d.path();
     File::create(t.join("script.js")).unwrap();
     let rules = vec![make_rule("scripts", "*.js", "Move", Some("Scripts"))];
-    let plan = plan_organize(t.to_str().unwrap(), &rules, &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &rules,
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, "script.js");
     assert_eq!(a.op, Op::Move);
     assert_eq!(a.dst.as_ref().unwrap(), &t.join("Scripts/script.js"));
@@ -1491,7 +1740,12 @@ fn test_collision_in_other_directory_is_skipped() {
     File::create(t.join("Other/mystery.xyz")).unwrap();
     File::create(t.join("mystery.xyz")).unwrap();
 
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, "mystery.xyz");
     assert_eq!(a.op, Op::Skip);
     assert_eq!(a.reason.as_deref(), Some("collision"));
@@ -1506,7 +1760,12 @@ fn test_broken_symlink_collision_in_other_directory_is_skipped() {
     symlink("/nonexistent", t.join("Other/mystery.xyz")).unwrap();
     File::create(t.join("mystery.xyz")).unwrap();
 
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let a = move_dest(&plan, "mystery.xyz");
     assert_eq!(a.op, Op::Skip);
     assert_eq!(a.reason.as_deref(), Some("collision"));
@@ -1517,7 +1776,12 @@ fn test_other_directory_creation_is_explicit_createdir() {
     let d = tempdir().unwrap();
     let t = d.path();
     File::create(t.join("mystery.xyz")).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(plan
         .actions
         .iter()
@@ -1535,7 +1799,12 @@ fn test_recursive_new_categories_stay_local() {
     File::create(t.join("nested/payload.json")).unwrap();
     File::create(t.join("nested/model.blend")).unwrap();
 
-    let rp = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let dst_of = |name: &str| {
         rp.plan
             .actions
@@ -1597,11 +1866,21 @@ fn test_organize_second_run_is_idempotent() {
     File::create(t.join("data.json")).unwrap();
     File::create(t.join("mystery.xyz")).unwrap();
 
-    let rp1 = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp1 = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     execute_plan(rp1.plan, t.to_str().unwrap(), "organize-recursive", None);
 
     // Run again on the now-organized tree.
-    let rp2 = plan_organize_recursive(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let rp2 = plan_organize_recursive(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(
         !rp2.plan.actions.iter().any(|a| a.op == Op::Move),
         "a second run must find nothing left to move"
@@ -1625,7 +1904,12 @@ fn test_executor_toctou_protection_applies_to_other_category() {
 
     let src = t.join("race.xyz");
     File::create(&src).unwrap();
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     assert!(plan
         .actions
         .iter()
@@ -1667,7 +1951,12 @@ fn test_dry_run_zero_mutation_for_new_categories() {
     File::create(t.join("model.blend")).unwrap();
     File::create(t.join("mystery.xyz")).unwrap();
 
-    let _ = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let _ = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     for name in ["Images", "Data", "Code", "3D", "Other"] {
         assert!(
             !t.join(name).exists(),
@@ -1699,7 +1988,12 @@ fn test_undo_restores_files_moved_into_new_categories() {
     File::create(t.join("data.json")).unwrap();
     File::create(t.join("mystery.xyz")).unwrap();
 
-    let plan = plan_organize(t.to_str().unwrap(), &[], &CategoryDB::default());
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
     let (id, _outcomes) = execute_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(t.join("Code/codigo.js").exists());
     assert!(t.join("Data/data.json").exists());

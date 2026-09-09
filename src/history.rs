@@ -31,13 +31,26 @@ pub fn cmd_history() {
     crate::render::history(&items);
 }
 
-/// Attempts to reverse one successful, undoable Move outcome. Never
-/// overwrites anything; revalidates every assumption against the live
-/// filesystem via `symlink_metadata` immediately before acting.
+/// Dispatches to the type-specific undo for one successful, undoable
+/// outcome. `Op::Move` (files) and `Op::MoveDir` (whole directories, from
+/// `sift folders`) are deliberately handled by separate functions with
+/// opposite type checks, so neither can be weakened into accepting the
+/// other's source type.
 fn undo_one(action: &Action, outcome_was_ok: bool) -> Option<ActionResult> {
-    if action.op != Op::Move || !action.undoable || !outcome_was_ok {
+    if !action.undoable || !outcome_was_ok {
         return None;
     }
+    match action.op {
+        Op::Move => undo_move_file(action),
+        Op::MoveDir => undo_move_dir(action),
+        _ => None,
+    }
+}
+
+/// Attempts to reverse one successful, undoable file Move. Never
+/// overwrites anything; revalidates every assumption against the live
+/// filesystem via `symlink_metadata` immediately before acting.
+fn undo_move_file(action: &Action) -> Option<ActionResult> {
     let dst = action.dst.as_ref()?;
     let refuse = |reason: &str| {
         Some(ActionResult {
@@ -57,9 +70,8 @@ fn undo_one(action: &Action, outcome_was_ok: bool) -> Option<ActionResult> {
         Err(_) => return refuse("moved destination no longer exists"),
     };
     // Only a plain regular file may be moved back: never a symlink or a
-    // directory (directories are never within v0.1's move scope, so a
-    // directory sitting at the recorded destination means something else
-    // replaced the moved file after the fact).
+    // directory (a directory sitting at the recorded destination means
+    // something else replaced the moved file after the fact).
     if md.file_type().is_symlink() {
         return refuse("moved destination is a symlink");
     }
@@ -81,6 +93,52 @@ fn undo_one(action: &Action, outcome_was_ok: bool) -> Option<ActionResult> {
             src: dst.clone(),
             dst: Some(action.src.clone()),
             op: Op::Move,
+            result: Err(format!("Undo failed: {}", e)),
+            undoable: false,
+        }),
+    }
+}
+
+/// Attempts to reverse one successful, undoable directory MoveDir (from
+/// `sift folders`). Mirrors `undo_move_file`'s exact safety pattern with
+/// the opposite type check: the destination must still be a real
+/// directory, never a symlink or a plain file.
+fn undo_move_dir(action: &Action) -> Option<ActionResult> {
+    let dst = action.dst.as_ref()?;
+    let refuse = |reason: &str| {
+        Some(ActionResult {
+            src: dst.clone(),
+            dst: Some(action.src.clone()),
+            op: Op::MoveDir,
+            result: Err(format!("Undo refused: {}", reason)),
+            undoable: false,
+        })
+    };
+    if fs::symlink_metadata(&action.src).is_ok() {
+        return refuse("original location is occupied");
+    }
+    let md = match fs::symlink_metadata(dst) {
+        Ok(md) => md,
+        Err(_) => return refuse("moved destination no longer exists"),
+    };
+    if md.file_type().is_symlink() {
+        return refuse("moved destination is a symlink");
+    }
+    if !md.is_dir() {
+        return refuse("moved destination is not a directory");
+    }
+    match fs::rename(dst, &action.src) {
+        Ok(()) => Some(ActionResult {
+            src: dst.clone(),
+            dst: Some(action.src.clone()),
+            op: Op::MoveDir,
+            result: Ok(()),
+            undoable: false,
+        }),
+        Err(e) => Some(ActionResult {
+            src: dst.clone(),
+            dst: Some(action.src.clone()),
+            op: Op::MoveDir,
             result: Err(format!("Undo failed: {}", e)),
             undoable: false,
         }),

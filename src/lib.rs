@@ -3,6 +3,8 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod executor;
+pub mod explain;
+pub mod folders;
 pub mod fs;
 pub mod history;
 pub mod planner;

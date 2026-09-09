@@ -17,11 +17,27 @@ EXAMPLES:
                              Register a folder for automatic organization
   sift watch start ~/Inbox   Start watching (does not touch pre-existing files)
   sift watch list            Show every registered watch and its state
+  sift folders .             Preview which whole subfolders would move into Documents/Images/...
+  sift folders . --apply     Actually move high-confidence folders (never merges, never overwrites)
+  sift folders . --remove-duplicates --apply
+                             Also send exact-content duplicate files (inside similarly-named
+                             folders) to the Trash
+  sift config check ~/Downloads
+                             Validate the effective .sift.toml policy for a directory
+  sift explain ~/Downloads/movie.mp4
+                             Read-only: show exactly what organize would do to one file, and why
 
-Add --json to scan, organize, clean, or doctor for machine-readable output.
-Add --recursive to scan, organize, or doctor (not clean) to descend into
-eligible subdirectories; hidden, symlinked, protected, project-root, and
-Sift's own category directories are never entered.
+Add --json to scan, organize, clean, doctor, folders, config check, or
+explain for machine-readable output.
+Add --recursive to scan, organize, or doctor (not clean, not folders) to
+descend into eligible subdirectories; hidden, symlinked, protected,
+project-root, and Sift's own category directories are never entered.
+`sift folders` only ever looks at immediate child folders and moves whole
+folders intact — it never dismantles one, and medium-confidence folders are
+only ever suggested, never auto-moved. `--remove-duplicates` only compares
+files inside folders whose names already look like duplicates of each other,
+and only ever removes a file that is byte-for-byte identical to one already
+kept — sent to the Trash, never permanently deleted.
 See `sift watch --help` for the full watch command group.";
 
 /// Sift: a local-first, safe CLI to organize and clean up a directory.
@@ -124,6 +140,64 @@ pub enum Commands {
     Watch {
         #[command(subcommand)]
         action: WatchCommands,
+    },
+    /// Preview or apply moving whole immediate child folders into Documents/Images/...
+    /// based on the types of files they contain (never based on folder name alone).
+    /// Distinct from `organize --recursive`, which organizes files inside a folder but
+    /// never moves the folder itself. Only high-confidence folders are ever moved;
+    /// medium-confidence folders are only ever suggested, and uncertain/mixed/empty
+    /// folders and software projects are always left alone. There is no `--recursive`
+    /// flag: candidate selection is always exactly one level of immediate children.
+    Folders {
+        /// Directory whose immediate child folders to analyze
+        #[arg(default_value = ".")]
+        path: String,
+        /// Actually move high-confidence folders (default is a dry-run preview)
+        #[arg(long)]
+        apply: bool,
+        /// Print the analysis as JSON instead of a table
+        #[arg(long)]
+        json: bool,
+        /// Also compare files inside each name-based possible-duplicate
+        /// folder group and remove exact content matches (verified
+        /// byte-for-byte, never on a hash match alone) from every folder in
+        /// the group except the alphabetically-first one. Removal always
+        /// means sending to the system Trash — recoverable there, never
+        /// undoable via `sift undo`. Report-only unless combined with
+        /// --apply.
+        #[arg(long)]
+        remove_duplicates: bool,
+    },
+    /// Manage and validate `.sift.toml` Smart Folder policy
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
+    /// Read-only: explain exactly what `sift organize` would do to one file, and why
+    Explain {
+        /// The file to explain
+        file: String,
+        /// The policy root whose `.sift.toml` (or global/default policy)
+        /// applies. Defaults to the file's own parent directory — never
+        /// discovered by walking further up.
+        #[arg(long)]
+        root: Option<String>,
+        /// Print the explanation as JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommands {
+    /// Validate the effective `.sift.toml` policy for a directory
+    Check {
+        /// Directory whose effective policy to check
+        #[arg(default_value = ".")]
+        path: String,
+        /// Print the result as JSON instead of a table
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -264,6 +338,32 @@ pub fn dispatch(cli: Cli) -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         Commands::Watch { action } => dispatch_watch(action),
+        Commands::Folders {
+            path,
+            apply,
+            json,
+            remove_duplicates,
+        } => exit_code(crate::folders::cmd_folders(
+            path,
+            apply,
+            json,
+            remove_duplicates,
+        )),
+        Commands::Config { action } => match action {
+            ConfigCommands::Check { path, json } => {
+                let result = crate::config::resolve_policy(&path);
+                let ok = result.is_ok();
+                if json {
+                    println!("{}", crate::render::config_check_json(&result));
+                } else {
+                    crate::render::config_check(&path, &result);
+                }
+                exit_code(ok)
+            }
+        },
+        Commands::Explain { file, root, json } => {
+            exit_code(crate::explain::cmd_explain(file, root, json))
+        }
     }
 }
 

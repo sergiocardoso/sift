@@ -8,15 +8,15 @@
 
 use super::engine::{process_candidate, RootMonitor};
 use super::registry::{self, WatchState};
-use super::stability::DEFAULT_STABILITY_WINDOW;
 use crate::classifier::CategoryDB;
+use crate::config::EffectivePolicy;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 const EVENT_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
@@ -104,11 +104,28 @@ pub fn request_stop_and_wait(timeout: Duration) -> Result<bool, String> {
 /// bare `run()` loop) specifically so tests can drive `reconcile` /
 /// `drain_events` / `process_ready` deterministically without needing a
 /// real detached background process.
+/// One root's cached, already-resolved policy (or the error that made it
+/// invalid), keyed by the local `.sift.toml`'s mtime at the time it was
+/// resolved — `None` means no local file existed at that time. This is
+/// the entire hot-reload mechanism: a later check with a different mtime
+/// (file created, edited, or removed) simply re-resolves.
+struct CachedPolicy {
+    local_mtime: Option<SystemTime>,
+    resolved: Result<EffectivePolicy, String>,
+}
+
 pub struct Daemon {
     watcher: RecommendedWatcher,
     rx: Receiver<notify::Event>,
     monitors: HashMap<PathBuf, RootMonitor>,
     watched_paths: HashSet<PathBuf>,
+    policy_cache: HashMap<PathBuf, CachedPolicy>,
+    /// Roots whose policy is *currently* known to be invalid — automatic
+    /// mutation is suspended for exactly these roots. Tracked in memory
+    /// (mirrored into the registry's `config_error` for display) so a
+    /// healthy→unhealthy transition can be detected without a registry
+    /// round trip.
+    unhealthy: HashSet<PathBuf>,
 }
 
 impl Daemon {
@@ -125,7 +142,54 @@ impl Daemon {
             rx,
             monitors: HashMap::new(),
             watched_paths: HashSet::new(),
+            policy_cache: HashMap::new(),
+            unhealthy: HashSet::new(),
         })
+    }
+
+    /// Resolves (using the cache above when the local file's mtime hasn't
+    /// changed) the effective policy for `root`, and updates that root's
+    /// runtime health: a fresh transition into an invalid policy discards
+    /// any not-yet-stable candidates for `root` immediately (so they can
+    /// never later "become ready" once the policy is fixed — no backfill,
+    /// ever, by construction) and records the error on the registry entry
+    /// for `sift watch status`; a transition back to valid clears it.
+    fn refresh_policy(&mut self, root: &Path) -> Result<EffectivePolicy, String> {
+        let local_path = root.join(".sift.toml");
+        let current_mtime = fs::metadata(&local_path).and_then(|m| m.modified()).ok();
+
+        let cached_mtime = self.policy_cache.get(root).map(|c| c.local_mtime);
+        let resolved = if current_mtime.is_some() && cached_mtime == Some(current_mtime) {
+            self.policy_cache.get(root).unwrap().resolved.clone()
+        } else {
+            let resolved = crate::config::resolve_policy(&root.to_string_lossy());
+            self.policy_cache.insert(
+                root.to_path_buf(),
+                CachedPolicy {
+                    local_mtime: current_mtime,
+                    resolved: resolved.clone(),
+                },
+            );
+            resolved
+        };
+
+        match &resolved {
+            Ok(_) => {
+                if self.unhealthy.remove(root) {
+                    let _ = registry::set_config_health(root, None);
+                }
+            }
+            Err(e) => {
+                let just_became_unhealthy = self.unhealthy.insert(root.to_path_buf());
+                let _ = registry::set_config_health(root, Some(e.clone()));
+                if just_became_unhealthy {
+                    if let Some(m) = self.monitors.get_mut(root) {
+                        m.discard_pending();
+                    }
+                }
+            }
+        }
+        resolved
     }
 
     /// Whether `root` currently has a live `RootMonitor` (i.e. is actually
@@ -155,6 +219,8 @@ impl Daemon {
             .collect();
         for p in to_drop {
             self.monitors.remove(&p);
+            self.policy_cache.remove(&p);
+            self.unhealthy.remove(&p);
         }
         let to_unwatch: Vec<PathBuf> = self
             .watched_paths
@@ -181,6 +247,11 @@ impl Daemon {
                     self.watched_paths.insert(path.clone());
                 }
             }
+            // Resolve/refresh this root's policy every reconcile — cheap
+            // (mtime-cached), and this is what makes hot reload and
+            // fail-closed suspension work without any separate polling
+            // mechanism for `.sift.toml` itself.
+            let _ = self.refresh_policy(path);
         }
     }
 
@@ -197,12 +268,21 @@ impl Daemon {
             match self.rx.recv_timeout(remaining) {
                 Ok(event) => {
                     let now = Instant::now();
+                    let unhealthy = &self.unhealthy;
                     for path in event.paths {
                         if let Some((root, monitor)) = self
                             .monitors
                             .iter_mut()
                             .find(|(root, _)| path.starts_with(root.as_path()))
                         {
+                            // Never even start tracking a candidate while
+                            // this root's policy is broken — it must not
+                            // be backfilled once the policy is fixed, and
+                            // the simplest way to guarantee that is to
+                            // never have observed it in the first place.
+                            if unhealthy.contains(root) {
+                                continue;
+                            }
                             let _ = registry::record_event(root);
                             monitor.observe_event(&path, now);
                         }
@@ -216,21 +296,31 @@ impl Daemon {
 
     /// Polls every root's stability tracker and processes whatever has
     /// become stable: revalidate, plan (via the shared planner helper),
-    /// execute, then update that watch's registry stats.
+    /// execute, then update that watch's registry stats. A root whose
+    /// policy is currently invalid is skipped entirely — no candidate for
+    /// it is ever moved, and none of its pending candidates can have
+    /// survived to this point anyway (see `refresh_policy`).
     pub fn process_ready(&mut self) {
         let now = Instant::now();
+        let unhealthy = self.unhealthy.clone();
+        let policy_cache = &self.policy_cache;
+        let builtin = CategoryDB::default();
         for (root, monitor) in self.monitors.iter_mut() {
-            let ready = monitor.poll_ready(now, DEFAULT_STABILITY_WINDOW);
+            if unhealthy.contains(root) {
+                continue;
+            }
+            let Some(policy) = policy_cache
+                .get(root)
+                .and_then(|c| c.resolved.as_ref().ok())
+            else {
+                continue;
+            };
+            let ready = monitor.poll_ready(now, policy.stability);
             if ready.is_empty() {
                 continue;
             }
-            let cfg_path = crate::config::find_config(&root.to_string_lossy());
-            let config = cfg_path
-                .and_then(|p| crate::config::load_config(&p).ok())
-                .unwrap_or_default();
-            let builtin = CategoryDB::default();
             for path in ready {
-                let outcome = process_candidate(root, &config.rules, &builtin, &path);
+                let outcome = process_candidate(root, policy, &builtin, &path);
                 if outcome.organized {
                     let _ = registry::record_success(root, 1);
                 } else if let Some(err) = &outcome.failure {

@@ -1,5 +1,5 @@
 use crate::domain::{ActionResult, HistoryItem, Op, Plan};
-use crate::fs::{safe_create_dir, safe_rename, send_to_trash};
+use crate::fs::{safe_create_dir, safe_rename, safe_rename_dir, send_to_trash};
 use crate::history::{new_history_id, record_history};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +35,16 @@ pub fn execute_plan(
                     Err("Missing destination".to_string())
                 }
             }
+            Op::MoveDir => {
+                if let Some(ref dst) = action.dst {
+                    match safe_rename_dir(&action.src, dst) {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(format!("MoveDir failed: {}", e)),
+                    }
+                } else {
+                    Err("Missing destination".to_string())
+                }
+            }
             Op::Trash => match send_to_trash(&action.src) {
                 Ok(()) => Ok(()),
                 Err(e) => Err(format!("Trash failed: {}", e)),
@@ -46,7 +56,9 @@ pub fn execute_plan(
             dst: action.dst.clone(),
             op: action.op.clone(),
             result: op_result.clone(),
-            undoable: action.undoable && op_result.is_ok() && matches!(action.op, Op::Move),
+            undoable: action.undoable
+                && op_result.is_ok()
+                && matches!(action.op, Op::Move | Op::MoveDir),
         });
     }
     let ts = SystemTime::now()

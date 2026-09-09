@@ -44,6 +44,14 @@ pub fn cmd_watch_add(path: String, auto_apply: bool, recursive: bool) -> bool {
             return false;
         }
     };
+    // If this root already has a local `.sift.toml`, it must be valid
+    // before we ever register an auto-apply watch against it — never
+    // register a watch whose policy is already known to be broken.
+    if let Err(e) = crate::config::resolve_policy(&canonical.to_string_lossy()) {
+        eprintln!("Refusing to add watch: invalid configuration.");
+        eprintln!("{e}");
+        return false;
+    }
     match registry::add(canonical.clone(), true, recursive) {
         Ok(_) => {
             println!("Added watch: {}", canonical.display());
@@ -91,6 +99,15 @@ fn cmd_watch_transition(path: String, to: WatchState, verb: &str) -> bool {
         eprintln!("{path}: no such directory");
         return false;
     };
+    // Never start (or resume) an auto-apply watch against a known-invalid
+    // policy — validate before the transition, not after.
+    if to == WatchState::Running {
+        if let Err(e) = crate::config::resolve_policy(&canonical.to_string_lossy()) {
+            eprintln!("Refusing to start watch: invalid configuration.");
+            eprintln!("{e}");
+            return false;
+        }
+    }
     match registry::transition(&canonical, to) {
         Ok(entry) => {
             println!(
@@ -162,11 +179,22 @@ pub fn cmd_watch_list(json: bool) -> bool {
             WatchState::Stopped => "\u{25cb}", // ○
         };
         println!("  {symbol}  {}", w.path.display());
+        let health = match (w.state, &w.config_error) {
+            (WatchState::Running, Some(_)) => " · suspended",
+            (WatchState::Running, None) => " · healthy",
+            _ => "",
+        };
         println!(
-            "     {} · auto-apply · recursive {}",
+            "     {} · auto-apply · recursive {}{health}",
             w.state.label(),
             if w.recursive { "on" } else { "off" }
         );
+        if w.state == WatchState::Running {
+            if let Some(err) = &w.config_error {
+                println!("     Configuration error: {err}");
+                println!("     Automatic organization is suspended.");
+            }
+        }
         if w.organized_count > 0 || w.last_success_at.is_some() {
             println!(
                 "     {} organized · last activity {}",
@@ -205,12 +233,25 @@ pub fn cmd_watch_status(path: Option<String>, json: bool) -> bool {
                 return true;
             }
             println!("Path:          {}", entry.path.display());
-            println!("State:         {}", entry.state.label());
+            let health = match (entry.state, &entry.config_error) {
+                (WatchState::Running, Some(_)) => " · suspended",
+                (WatchState::Running, None) => " · healthy",
+                _ => "",
+            };
+            println!("State:         {}{health}", entry.state.label());
             println!("Recursive:     {}", entry.recursive);
             println!("Auto-apply:    {}", entry.auto_apply);
             println!("Organized:     {}", entry.organized_count);
             println!("Errors:        {}", entry.error_count);
             println!("Last activity: {}", relative_activity(&entry));
+            if entry.state == WatchState::Running {
+                if let Some(err) = &entry.config_error {
+                    println!();
+                    println!("Configuration error:");
+                    println!("  {err}");
+                    println!("Automatic organization is suspended.");
+                }
+            }
             if let Some(err) = &entry.last_error {
                 println!("Last error:    {err}");
             }

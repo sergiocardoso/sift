@@ -96,6 +96,14 @@ pub struct WatchEntry {
     pub organized_count: u64,
     #[serde(default)]
     pub error_count: u64,
+    /// Runtime **health**, distinct from the requested `state` above: when
+    /// `Some(message)`, this watch's `.sift.toml` (or global config) is
+    /// currently invalid, so the daemon has suspended automatic mutation
+    /// for it entirely — no fallback, no guessing, no processing — while
+    /// still leaving it registered as `running`/`paused`/whatever the user
+    /// asked for. Cleared the moment the policy becomes valid again.
+    #[serde(default)]
+    pub config_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -207,6 +215,7 @@ pub fn add(canonical: PathBuf, auto_apply: bool, recursive: bool) -> Result<Watc
             last_error: None,
             organized_count: 0,
             error_count: 0,
+            config_error: None,
         };
         reg.watches.push(entry.clone());
         Ok(entry)
@@ -256,6 +265,10 @@ pub fn transition(canonical: &Path, to: WatchState) -> Result<WatchEntry, String
         }
         entry.state = to;
         entry.updated_at = now_secs();
+        // Runtime health is only meaningful while actually running; any
+        // stale suspension notice from a previous run is cleared on any
+        // explicit state change, not left to look current when it isn't.
+        entry.config_error = None;
         Ok(entry.clone())
     })?
 }
@@ -288,6 +301,22 @@ pub fn record_error(canonical: &Path, message: String) -> Result<(), String> {
             e.error_count += 1;
             e.last_error = Some(message);
             e.updated_at = now;
+        }
+    })
+}
+
+/// Sets or clears this watch's runtime `config_error` health, distinct
+/// from `record_error` (which tracks a *processing* failure like a
+/// collision). Only updates `updated_at` when the health actually
+/// changes, so a healthy watch that stays healthy tick after tick doesn't
+/// generate constant no-op writes.
+pub fn set_config_health(canonical: &Path, error: Option<String>) -> Result<(), String> {
+    with_registry(|reg| {
+        if let Some(e) = reg.find_mut(canonical) {
+            if e.config_error != error {
+                e.config_error = error;
+                e.updated_at = now_secs();
+            }
         }
     })
 }

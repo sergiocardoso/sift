@@ -5,6 +5,7 @@
 //! `--json` output bypasses this module entirely and is untouched by it.
 
 use crate::domain::{Action, ActionResult, Entry, HistoryItem, Op};
+use crate::folders::{Decision, FolderCandidate, FoldersPlan};
 use crate::scanner::DoctorFinding;
 use std::path::Path;
 
@@ -48,27 +49,16 @@ pub fn human_size(bytes: u64) -> String {
 }
 
 /// Formats a UNIX timestamp (seconds) as `YYYY-MM-DD HH:MM UTC`, with no
-/// external date dependency. Implements the well-known `civil_from_days`
-/// algorithm (Howard Hinnant), which is exact for the proleptic Gregorian
-/// calendar over the full `i64` range; only non-negative input is expected
-/// here since timestamps come from `SystemTime::now()`.
+/// external date dependency. Only non-negative input is expected here
+/// since timestamps come from `SystemTime::now()`. The calendar-date math
+/// itself lives in `utils::civil_from_unix_secs` — the Date organize
+/// strategy uses the exact same function, so there's one implementation
+/// of "timestamp to calendar date" in the whole crate.
 pub fn format_timestamp(secs: u64) -> String {
     let secs = secs as i64;
-    let days = secs / 86400;
-    let rem = secs % 86400;
+    let rem = secs.rem_euclid(86400);
     let (hour, minute) = (rem / 3600, (rem % 3600) / 60);
-
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-
+    let (year, month, day) = crate::utils::civil_from_unix_secs(secs);
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
@@ -181,6 +171,23 @@ fn refusal_notice(command: &str, path: &str) {
     println!(
         "{command} never mutates a project root — run `sift doctor {path}` to inspect it safely."
     );
+}
+
+/// Reported when `resolve_policy` fails for a manual command: the local
+/// (or global) `.sift.toml` exists but is invalid. Refuses to run rather
+/// than silently falling back to defaults — a broken policy is never
+/// quietly ignored, whether or not Watch is involved.
+pub fn policy_error(command: &str, path: &str, error: &str) {
+    println!("Sift {command}");
+    println!("{path}");
+    println!();
+    println!("{} Invalid configuration", colorize("✗", "31", use_color()));
+    println!();
+    for line in error.lines() {
+        println!("  {line}");
+    }
+    println!();
+    println!("No changes made.");
 }
 
 pub fn organize_dry_run(path: &str, actions: &[Action], is_project_root: bool, verbose: bool) {
@@ -725,6 +732,7 @@ pub fn history(items: &[HistoryItem]) {
 
     for item in sorted {
         let moved = count_ok(&item.outcomes, Op::Move);
+        let moved_dirs = count_ok(&item.outcomes, Op::MoveDir);
         let created = count_ok(&item.outcomes, Op::CreateDir);
         let trashed = count_ok(&item.outcomes, Op::Trash);
         let skipped = item.outcomes.iter().filter(|o| o.op == Op::Skip).count();
@@ -738,6 +746,14 @@ pub fn history(items: &[HistoryItem]) {
                 "moved"
             };
             parts.push(format!("{moved} {label}"));
+        }
+        if moved_dirs > 0 {
+            let label = if item.kind == "undo" {
+                "folders restored"
+            } else {
+                "folders moved"
+            };
+            parts.push(format!("{moved_dirs} {label}"));
         }
         if created > 0 {
             parts.push(format!("{created} directories"));
@@ -804,7 +820,7 @@ pub fn undo_result(id: &str, restored: usize, refused: &[ActionResult], trash_sk
         println!("Nothing to undo.");
     } else if refused.is_empty() {
         println!(
-            "{} {restored} file{} restored",
+            "{} {restored} item{} restored",
             colorize("✓", "32", color),
             plural(restored)
         );
@@ -834,5 +850,513 @@ pub fn undo_result(id: &str, restored: usize, refused: &[ActionResult], trash_sk
             "{trash_skipped} trashed file{} can't be undone here — restore from your system Trash if needed.",
             plural(trash_skipped)
         );
+    }
+}
+
+// ---------------------------------------------------------- config check
+
+#[derive(serde::Serialize)]
+struct ConfigCheckJson {
+    valid: bool,
+    source: Option<String>,
+    version: Option<i64>,
+    strategy: Option<String>,
+    unknown: Option<String>,
+    template: Option<String>,
+    date_source: Option<String>,
+    stability_seconds: Option<u64>,
+    rules: Option<usize>,
+    error: Option<String>,
+}
+
+pub fn config_check_json(result: &Result<crate::config::EffectivePolicy, String>) -> String {
+    let payload = match result {
+        Ok(p) => ConfigCheckJson {
+            valid: true,
+            source: Some(p.source.describe()),
+            version: Some(p.version),
+            strategy: Some(p.strategy.as_str().to_string()),
+            unknown: Some(p.unknown_policy.as_str().to_string()),
+            template: p.template.as_ref().map(|t| t.raw().to_string()),
+            date_source: p.date_source.map(|d| d.as_str().to_string()),
+            stability_seconds: Some(p.stability.as_secs()),
+            rules: Some(p.rules.len()),
+            error: None,
+        },
+        Err(e) => ConfigCheckJson {
+            valid: false,
+            source: None,
+            version: None,
+            strategy: None,
+            unknown: None,
+            template: None,
+            date_source: None,
+            stability_seconds: None,
+            rules: None,
+            error: Some(e.clone()),
+        },
+    };
+    serde_json::to_string_pretty(&payload).unwrap()
+}
+
+pub fn config_check(path: &str, result: &Result<crate::config::EffectivePolicy, String>) {
+    use crate::config::OrganizeStrategy;
+    let color = use_color();
+    println!("Sift config");
+    println!("{path}");
+    println!();
+    match result {
+        Ok(policy) => {
+            println!("{} Configuration valid", colorize("✓", "32", color));
+            println!();
+            println!("Source");
+            println!("  {}", policy.source.describe());
+            println!();
+            println!("Version");
+            println!("  {}", policy.version);
+            println!();
+            println!("Organization");
+            println!("  strategy     {}", policy.strategy.as_str());
+            match policy.strategy {
+                OrganizeStrategy::Type => {
+                    println!("  unknown      {}", policy.unknown_policy.as_str());
+                }
+                OrganizeStrategy::Date => {
+                    println!(
+                        "  date source  {}",
+                        policy
+                            .date_source
+                            .expect("validated: Date always has a date_source")
+                            .as_str()
+                    );
+                    println!(
+                        "  template     {}",
+                        policy
+                            .template
+                            .as_ref()
+                            .expect("validated: Date always has a template")
+                            .raw()
+                    );
+                }
+            }
+            println!();
+            println!("Watch");
+            println!("  stability    {}s", policy.stability.as_secs());
+            println!();
+            println!("Rules");
+            println!("  {}", policy.rules.len());
+        }
+        Err(e) => {
+            println!("{} Invalid configuration", colorize("✗", "31", color));
+            println!();
+            for line in e.lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    println!();
+    println!("No filesystem changes were made.");
+}
+
+// -------------------------------------------------------------- explain
+
+pub fn explain_json(exp: &crate::explain::Explanation) -> String {
+    serde_json::to_string_pretty(exp).unwrap()
+}
+
+pub fn explain(exp: &crate::explain::Explanation) {
+    use crate::config::OrganizeStrategy;
+    use crate::domain::Op;
+
+    println!("Sift explain");
+    println!(
+        "{}",
+        exp.file
+            .file_name()
+            .map(|n| n.display().to_string())
+            .unwrap_or_else(|| exp.file.display().to_string())
+    );
+    println!();
+    println!("Policy");
+    println!("  {}", exp.source.describe());
+    println!();
+    println!("Strategy");
+    if exp.matched_rule.is_some() {
+        println!(
+            "  {} (not used because rule matched)",
+            exp.strategy.as_str()
+        );
+    } else {
+        println!("  {}", exp.strategy.as_str());
+    }
+    println!();
+
+    match &exp.matched_rule {
+        Some((pattern, action, destination)) => {
+            println!("Rule");
+            match destination {
+                Some(d) => println!("  {pattern} → {action} {d}/"),
+                None => println!("  {pattern} → {action}"),
+            }
+        }
+        None => {
+            println!("Rules");
+            println!("  no matching rule");
+        }
+    }
+    println!();
+
+    // Only report strategy-specific evidence when a rule didn't already
+    // short-circuit it — matches `classify_for_organize`/`classify_for_date`,
+    // which never even reach classification/date-metadata once a rule
+    // matches.
+    if exp.matched_rule.is_some() {
+        // Nothing to add: the Rule section above already explains the
+        // decision fully.
+    } else {
+        match exp.strategy {
+            OrganizeStrategy::Type => match (&exp.classification, &exp.unknown_fallback) {
+                (Some(_), Some(policy)) => {
+                    println!("Classification");
+                    println!("  unknown");
+                    println!();
+                    println!("Policy (unknown)");
+                    println!("  unknown → {}", policy.as_str());
+                }
+                (Some(cat), None) => {
+                    let cat = *cat;
+                    println!("Classification");
+                    let ext = exp
+                        .file
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| format!(".{e}"))
+                        .unwrap_or_else(|| "(no extension)".to_string());
+                    println!("  {ext} → {cat:?}");
+                }
+                (None, _) => {
+                    println!("Classification");
+                    println!("  n/a");
+                }
+            },
+            OrganizeStrategy::Date => {
+                println!("Metadata");
+                match &exp.date_metadata {
+                    Some(meta) => {
+                        println!(
+                            "  modified     {:04}-{:02}-{:02}",
+                            meta.year, meta.month, meta.day
+                        );
+                        println!("  year         {:04}", meta.year);
+                        println!("  month        {:02}", meta.month);
+                        println!("  day          {:02}", meta.day);
+                    }
+                    None => println!("  unavailable"),
+                }
+                println!();
+                println!("Template");
+                println!("  {}", exp.template.as_deref().unwrap_or("(none)"));
+            }
+        }
+    }
+    println!();
+
+    println!("Destination");
+    match &exp.destination {
+        Some(dest) => println!("  {}", dest.display()),
+        None => println!("  (none)"),
+    }
+    println!();
+
+    println!("Decision");
+    println!(
+        "  {}",
+        match exp.op {
+            Op::Move => "MOVE",
+            Op::Trash => "TRASH",
+            Op::Skip => "SKIP",
+            Op::CreateDir => "CREATEDIR",
+            Op::MoveDir => "MOVEDIR",
+        }
+    );
+    println!("  {}", exp.reason);
+    println!();
+
+    println!("Safety");
+    let color = use_color();
+    for check in &exp.checks {
+        let mark = if check.ok {
+            colorize("✓", "32", color)
+        } else {
+            colorize("✗", "31", color)
+        };
+        match &check.detail {
+            Some(detail) => println!("  {mark} {} — {detail}", check.label),
+            None => println!("  {mark} {}", check.label),
+        }
+    }
+
+    println!();
+    println!("No changes were made.");
+}
+
+// --------------------------------------------------------------- folders
+
+#[derive(serde::Serialize)]
+struct FoldersJson<'a> {
+    root: &'a Path,
+    folders: &'a [FolderCandidate],
+    possible_duplicates: &'a [Vec<String>],
+    duplicate_removals: &'a [crate::folders::DuplicateRemoval],
+}
+
+/// `sift folders --json`: the full, unfiltered analysis (every candidate,
+/// whatever its decision), the report-only possible-duplicate groups, and
+/// (only when `--remove-duplicates` was requested) the content-verified
+/// removals planned. Bypasses every function below this — the JSON shape
+/// has no dependency on how the human-readable view is worded.
+pub fn folders_json(fp: &FoldersPlan, dup_removals: &[crate::folders::DuplicateRemoval]) -> String {
+    let payload = FoldersJson {
+        root: &fp.root,
+        folders: &fp.candidates,
+        possible_duplicates: &fp.possible_duplicates,
+        duplicate_removals: dup_removals,
+    };
+    serde_json::to_string_pretty(&payload).unwrap()
+}
+
+fn folder_dest_label(cat: crate::domain::Category) -> &'static str {
+    crate::planner::builtin_destination(cat)
+        .map(|(name, _)| name)
+        .unwrap_or("?")
+}
+
+pub fn folders_dry_run(fp: &FoldersPlan, dup_removals: &[crate::folders::DuplicateRemoval]) {
+    println!("Sift folders");
+    println!("{}", fp.root.display());
+
+    let mut moves: Vec<&FolderCandidate> = Vec::new();
+    let mut refused: Vec<&FolderCandidate> = Vec::new();
+    let mut suggests: Vec<&FolderCandidate> = Vec::new();
+    let mut protects: Vec<&FolderCandidate> = Vec::new();
+    let mut leaves: Vec<&FolderCandidate> = Vec::new();
+    for c in &fp.candidates {
+        match &c.decision {
+            Decision::Move { .. } => moves.push(c),
+            Decision::MoveRefused { .. } => refused.push(c),
+            Decision::Suggest { .. } => suggests.push(c),
+            Decision::Protect { .. } => protects.push(c),
+            Decision::Leave { .. } => leaves.push(c),
+        }
+    }
+
+    println!();
+    println!("Plan");
+    println!("  {} folder{} to move", moves.len(), plural(moves.len()));
+    if !refused.is_empty() {
+        println!("  {} move{} refused", refused.len(), plural(refused.len()));
+    }
+    println!("  {} suggestion{}", suggests.len(), plural(suggests.len()));
+    println!("  {} protected", protects.len());
+    println!("  {} uncertain", leaves.len());
+
+    if !moves.is_empty() {
+        println!();
+        println!("Move");
+        let width = moves.iter().map(|c| c.name.len() + 1).max().unwrap_or(0);
+        for c in &moves {
+            if let Decision::Move {
+                category,
+                confidence,
+            } = &c.decision
+            {
+                let name = format!("{}/", c.name);
+                println!(
+                    "  {name:<width$}  → {}/   {:.0}%  ({} file{})",
+                    folder_dest_label(*category),
+                    confidence * 100.0,
+                    c.evidence_files,
+                    plural(c.evidence_files)
+                );
+            }
+        }
+    }
+
+    if !refused.is_empty() {
+        println!();
+        println!("Move refused");
+        let width = refused.iter().map(|c| c.name.len() + 1).max().unwrap_or(0);
+        for c in &refused {
+            if let Decision::MoveRefused {
+                category, reason, ..
+            } = &c.decision
+            {
+                let name = format!("{}/", c.name);
+                println!(
+                    "  {name:<width$}  → {}/   {reason}",
+                    folder_dest_label(*category)
+                );
+            }
+        }
+    }
+
+    if !suggests.is_empty() {
+        println!();
+        println!("Suggestions");
+        let width = suggests.iter().map(|c| c.name.len() + 1).max().unwrap_or(0);
+        for c in &suggests {
+            if let Decision::Suggest {
+                category,
+                confidence,
+                reason,
+            } = &c.decision
+            {
+                let name = format!("{}/", c.name);
+                println!(
+                    "  {name:<width$}  → {}/   {:.0}%  {reason} ({} file{})",
+                    folder_dest_label(*category),
+                    confidence * 100.0,
+                    c.evidence_files,
+                    plural(c.evidence_files)
+                );
+            }
+        }
+    }
+
+    if !protects.is_empty() {
+        println!();
+        println!("Protected");
+        let width = protects.iter().map(|c| c.name.len() + 1).max().unwrap_or(0);
+        for c in &protects {
+            if let Decision::Protect { reason } = &c.decision {
+                let name = format!("{}/", c.name);
+                println!("  {name:<width$}  {reason}");
+            }
+        }
+    }
+
+    if !leaves.is_empty() {
+        println!();
+        println!("Uncertain");
+        let width = leaves.iter().map(|c| c.name.len() + 1).max().unwrap_or(0);
+        for c in &leaves {
+            if let Decision::Leave { reason } = &c.decision {
+                let name = format!("{}/", c.name);
+                println!("  {name:<width$}  {reason}");
+            }
+        }
+    }
+
+    if !fp.possible_duplicates.is_empty() {
+        println!();
+        println!("Possible duplicates (report only — never merged or moved)");
+        for group in &fp.possible_duplicates {
+            println!("  {}", group.join(", "));
+        }
+    }
+
+    if !dup_removals.is_empty() {
+        println!();
+        println!("Duplicate files (identical content — will be sent to Trash, not undoable via sift undo)");
+        let target = fp.root.as_path();
+        let width = dup_removals
+            .iter()
+            .map(|r| display_rel(&r.remove, target).len())
+            .max()
+            .unwrap_or(0);
+        for r in dup_removals {
+            println!(
+                "  {:<width$}  = {}  ({})",
+                display_rel(&r.remove, target),
+                display_rel(&r.keep, target),
+                human_size(r.size)
+            );
+        }
+    }
+
+    println!();
+    if moves.is_empty() && dup_removals.is_empty() {
+        println!("No changes made.");
+    } else {
+        println!("No changes made.");
+        let mut todo = Vec::new();
+        if !moves.is_empty() {
+            todo.push(format!(
+                "move {} folder{}",
+                moves.len(),
+                plural(moves.len())
+            ));
+        }
+        if !dup_removals.is_empty() {
+            todo.push(format!(
+                "remove {} duplicate file{}",
+                dup_removals.len(),
+                plural(dup_removals.len())
+            ));
+        }
+        println!("Run with --apply to {}.", todo.join(" and "));
+    }
+}
+
+pub fn folders_apply_result(outcomes: &[ActionResult], hist_id: &str) {
+    let color = use_color();
+    let moved = count_ok(outcomes, Op::MoveDir);
+    let created = count_ok(outcomes, Op::CreateDir);
+    let trashed = count_ok(outcomes, Op::Trash);
+    let skipped = outcomes.iter().filter(|o| o.op == Op::Skip).count();
+    let failed = outcomes.iter().filter(|o| o.result.is_err()).count();
+
+    println!("Sift folders");
+    println!();
+    if failed == 0 {
+        println!("{} Applied successfully", colorize("✓", "32", color));
+    } else {
+        println!(
+            "{} Applied with {failed} failure{}",
+            colorize("⚠", "33", color),
+            plural(failed)
+        );
+    }
+    println!();
+    println!("  {moved} folder{} moved", plural(moved));
+    if created > 0 {
+        println!(
+            "  {created} categor{} created",
+            if created == 1 { "y" } else { "ies" }
+        );
+    }
+    if trashed > 0 {
+        println!(
+            "  {trashed} duplicate file{} sent to Trash",
+            plural(trashed)
+        );
+    }
+    println!(
+        "  {skipped} entr{} left untouched",
+        if skipped == 1 { "y" } else { "ies" }
+    );
+    println!("  {failed} failure{}", plural(failed));
+
+    if failed > 0 {
+        println!();
+        println!("Failures");
+        for o in outcomes.iter().filter(|o| o.result.is_err()) {
+            if let Err(ref e) = o.result {
+                println!("  {}  {e}", o.src.display());
+            }
+        }
+    }
+
+    println!();
+    println!("History");
+    println!("  {hist_id}");
+
+    if outcomes.iter().any(|o| o.undoable) {
+        println!();
+        println!("Undo");
+        println!("  sift undo {hist_id}");
+    } else if moved > 0 {
+        println!();
+        println!("Folder moves are not undoable in this version.");
     }
 }

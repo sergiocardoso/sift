@@ -16,6 +16,8 @@ pub enum FSActionError {
     Link,
     #[error("Is directory (not supported v0.1)")]
     Dir,
+    #[error("Not a directory")]
+    NotADirectory,
     #[error("Permission denied")]
     Perm,
     #[error("Unsafe path: an ancestor directory is a symlink")]
@@ -24,13 +26,25 @@ pub enum FSActionError {
     Other(String),
 }
 
+fn map_rename_error(e: std::io::Error) -> FSActionError {
+    if e.kind() == std::io::ErrorKind::CrossesDevices {
+        FSActionError::CrossFS
+    } else if e.kind() == std::io::ErrorKind::AlreadyExists {
+        FSActionError::DestExists
+    } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+        FSActionError::Perm
+    } else {
+        FSActionError::RenameErr(e.to_string())
+    }
+}
+
 /// Returns true if every *existing* ancestor directory of `path` is a real
 /// directory, never a symlink. Walks upward from `path`'s parent and stops
 /// at the first missing ancestor, since a single (non-recursive) create or
 /// rename can't traverse through one anyway. This is the executor-side
 /// re-check that a destination validated at plan time hasn't since had one
 /// of its directory components swapped for a symlink (TOCTOU).
-fn ancestors_are_safe(path: &Path) -> bool {
+pub(crate) fn ancestors_are_safe(path: &Path) -> bool {
     let mut cur = path.parent();
     while let Some(dir) = cur {
         match fs::symlink_metadata(dir) {
@@ -66,17 +80,38 @@ pub fn safe_rename(src: &PathBuf, dst: &PathBuf) -> Result<(), FSActionError> {
     if md.is_dir() {
         return Err(FSActionError::Dir);
     }
-    fs::rename(src, dst).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::CrossesDevices {
-            FSActionError::CrossFS
-        } else if e.kind() == std::io::ErrorKind::AlreadyExists {
-            FSActionError::DestExists
-        } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-            FSActionError::Perm
-        } else {
-            FSActionError::RenameErr(e.to_string())
+    fs::rename(src, dst).map_err(map_rename_error)
+}
+
+/// Moves an entire directory intact — the counterpart to `safe_rename` for
+/// `Op::MoveDir`. Deliberately a separate function with the *opposite*
+/// type requirement (`src` must be a real directory, never a regular
+/// file), so `safe_rename`'s file-only guarantee is never loosened to
+/// "anything that isn't a symlink". Same collision/ancestor/no-overwrite/
+/// no-cross-filesystem-fallback guarantees as `safe_rename`.
+pub fn safe_rename_dir(src: &PathBuf, dst: &PathBuf) -> Result<(), FSActionError> {
+    if !ancestors_are_safe(dst) {
+        return Err(FSActionError::UnsafeAncestor);
+    }
+    // Destination check: occupied means anything (dir, file, symlink, broken symlink)
+    match dst.symlink_metadata() {
+        Ok(_) => return Err(FSActionError::DestExists),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(FSActionError::Other(e.to_string()))
         }
-    })
+        Err(_) => {}
+    }
+    let md = match src.symlink_metadata() {
+        Ok(md) => md,
+        Err(_) => return Err(FSActionError::SourceMissing),
+    };
+    if md.file_type().is_symlink() {
+        return Err(FSActionError::Link);
+    }
+    if !md.is_dir() {
+        return Err(FSActionError::NotADirectory);
+    }
+    fs::rename(src, dst).map_err(map_rename_error)
 }
 
 // Safe, atomic, idempotent directory creation, never overwrites, no-follow symlinks, error if exists and not a directory

@@ -5,6 +5,7 @@
 //! against the deterministic registry/eligibility/stability/engine layer;
 //! one test at the bottom drives a real `notify` watcher end to end.
 
+use sift::config::EffectivePolicy;
 use sift::domain::{HistoryItem, Op};
 use sift::watch::daemon::Daemon;
 use sift::watch::engine::{process_candidate, RootMonitor};
@@ -23,7 +24,14 @@ use tempfile::tempdir;
 fn with_isolated_registry(f: impl FnOnce(&std::path::Path)) {
     let d = tempdir().unwrap();
     set_test_watch_dir(d.path().join(".sift-watch-test"));
+    // Also isolate the "global config" lookup to an empty directory: any
+    // test root here that has no local `.sift.toml` must resolve to
+    // built-in defaults, never the real user's `~/.config/sift/config.toml`.
+    let global_dir = d.path().join(".sift-global-config-test");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    sift::config::set_test_global_config_dir(global_dir);
     f(d.path());
+    sift::config::clear_test_global_config_dir();
     clear_test_watch_dir();
 }
 
@@ -464,7 +472,12 @@ fn watched_json_goes_to_data() {
     let f = root.join("data.json");
     fs::write(&f, b"{}").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(outcome.organized);
         assert!(root.join("Data/data.json").exists());
     });
@@ -477,7 +490,12 @@ fn watched_unknown_extension_goes_to_other() {
     let f = root.join("mystery.xyz");
     fs::write(&f, b"x").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(outcome.organized);
         assert!(root.join("Other/mystery.xyz").exists());
     });
@@ -490,7 +508,12 @@ fn watched_blend_goes_to_3d() {
     let f = root.join("model.blend");
     fs::write(&f, b"x").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(outcome.organized);
         assert!(root.join("3D/model.blend").exists());
     });
@@ -512,7 +535,12 @@ fn watched_config_rule_overrides_builtin_category() {
         description: None,
     }];
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &rules, &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default().with_rules(rules),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(outcome.organized);
         assert!(root.join("Scripts/script.js").exists());
         assert!(!root.join("Code/script.js").exists());
@@ -526,7 +554,12 @@ fn watched_explicit_createdir_is_recorded_in_history() {
     let f = root.join("photo.jpg");
     fs::write(&f, b"x").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         let id = outcome.history_id.unwrap();
         let hist_dir = root.join(".sift-history-test");
         let content = fs::read_to_string(hist_dir.join(format!("{id}.json"))).unwrap();
@@ -544,7 +577,12 @@ fn watched_collision_never_overwrites() {
     let f = root.join("photo.jpg");
     fs::write(&f, b"new").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(!outcome.organized);
         assert_eq!(outcome.skip_reason.as_deref(), Some("collision"));
         assert_eq!(
@@ -564,7 +602,12 @@ fn watched_broken_symlink_collision_never_overwrites() {
     let f = root.join("photo.jpg");
     fs::write(&f, b"new").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(!outcome.organized);
         assert_eq!(outcome.skip_reason.as_deref(), Some("collision"));
         assert!(f.exists());
@@ -585,7 +628,12 @@ fn watched_toctou_collision_is_refused_and_recorded() {
     fs::create_dir_all(root.join("Images")).unwrap();
     fs::write(root.join("Images/race.jpg"), b"existing").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(!outcome.organized);
         assert!(f.exists());
         assert_eq!(
@@ -607,7 +655,12 @@ fn watched_symlink_ancestor_introduced_after_planning_refused() {
     // already a symlink escape target before we ever process the event.
     symlink(outside.path(), root.join("Other")).unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(!outcome.organized);
         assert_eq!(
             std::fs::read_dir(outside.path()).unwrap().count(),
@@ -630,7 +683,12 @@ fn recursive_watch_organizes_in_local_containing_directory() {
     let f = root.join("Client/invoice.pdf");
     fs::write(&f, b"x").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(outcome.organized);
         assert!(root.join("Client/Documents/invoice.pdf").exists());
         assert!(!root.join("Documents").exists());
@@ -646,7 +704,12 @@ fn recursive_watch_protects_newly_created_project_subtree() {
     fs::write(&f, b"x").unwrap();
     fs::write(root.join("app/package.json"), b"{}").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(!outcome.organized);
         assert!(f.exists());
     });
@@ -663,7 +726,12 @@ fn watch_move_records_origin_metadata() {
     let f = root.join("photo.jpg");
     fs::write(&f, b"x").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         let id = outcome.history_id.unwrap();
         let content =
             fs::read_to_string(root.join(".sift-history-test").join(format!("{id}.json"))).unwrap();
@@ -680,7 +748,12 @@ fn watch_move_can_be_undone_normally() {
     let f = root.join("photo.jpg");
     fs::write(&f, b"x").unwrap();
     with_isolated_history(root, || {
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(root.join("Images/photo.jpg").exists());
         sift::history::cmd_undo(outcome.history_id.unwrap());
         assert!(f.exists());
@@ -699,7 +772,12 @@ fn watch_failed_action_is_recorded_and_not_undoable() {
     with_isolated_history(root, || {
         // This is a plan-time collision skip, so no history is written at
         // all (nothing was executed) — confirm that directly.
-        let outcome = process_candidate(root, &[], &sift::classifier::CategoryDB::default(), &f);
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
         assert!(outcome.history_id.is_none());
         assert!(outcome.failure.is_none());
         assert_eq!(outcome.skip_reason.as_deref(), Some("collision"));
