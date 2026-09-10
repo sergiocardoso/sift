@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.2.1] - 2026-09-10
+- Fixed `release.yml`: the new `sift-tray` release job was building against the wrong package (root `sift` instead of the `sift-tray` workspace member), so no `sift-tray` archives were actually published on v0.2.0. No other changes.
+
 ## [v0.2.0] - 2026-09-10
 - Relicensed from MIT to Apache License, Version 2.0.
 - `sift watch start`/`resume` now try (best-effort, silently) to auto-launch the optional `sift-tray` app if it's installed and not already running.

@@ -77,6 +77,10 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: sift-tray
+          # `sift-tray` is a workspace member, not the root package (that's
+          # `sift` itself) — without this, cargo only looks for the `bin`
+          # target inside the root package and fails to find it.
+          package: sift-tray
           target: ${{ matrix.target }}
           checksum: sha256
         env:
