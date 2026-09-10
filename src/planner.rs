@@ -1,7 +1,7 @@
 use crate::classifier::CategoryDB;
 use crate::config::{
-    resolve_policy, rules_by_priority, safe_join_under, validate_rule_destination, EffectivePolicy,
-    OrganizeStrategy, Rule, UnknownPolicy,
+    resolve_nested_policy_override, resolve_policy, rules_by_priority, safe_join_under,
+    validate_rule_destination, EffectivePolicy, OrganizeStrategy, Rule, UnknownPolicy,
 };
 use crate::domain::{Action, Category, Entry, Op, Plan};
 use crate::scanner::{is_project_root, scan_entries};
@@ -1424,47 +1424,177 @@ pub fn plan_organize_date_recursive(
     }
 }
 
-/// The recursive counterpart to `plan_with_strategy`: same one-strategy
-/// dispatch, applied consistently across every directory the recursive
-/// scan discovers under the root's own policy (there is no per-directory
-/// nested `.sift.toml` discovery in this MVP — the root's resolved policy
-/// is the policy for the whole recursive operation).
+/// Whether `name` could be a directory `policy` — the governing policy of
+/// the directory currently being scanned — would itself move files into:
+/// its built-in category destinations (the same reserved names
+/// `scanner::is_sift_category_dir` already protects globally for
+/// `strategy = "type"`) plus any of its own `[[rules]]` `Move`
+/// destinations, which have no such global reservation since they're
+/// arbitrary names the config author chose. Nested recursive
+/// organize/watch needs this in addition to `is_sift_category_dir`: a
+/// subfolder's own local `.sift.toml` (e.g. `destination = "PDF"`) can
+/// declare a destination name that isn't one of the nine reserved ones, and
+/// without this check the walk would re-enter it and reclassify what it
+/// already organized (`PDF/PDF/…`).
+pub(crate) fn could_be_own_output_dir(policy: &EffectivePolicy, name: &str) -> bool {
+    crate::scanner::is_sift_category_dir(name)
+        || policy
+            .rules
+            .iter()
+            .any(|r| r.action == "Move" && r.destination.as_deref() == Some(name))
+}
+
+/// The nested-`.sift.toml`-aware recursive walk shared by every strategy:
+/// generalizes `plan_organize_recursive`/`plan_organize_date_recursive`'s
+/// traversal so a subfolder's own local `.sift.toml`
+/// (`config::resolve_nested_policy_override`) takes over its own subtree — its own
+/// strategy, rules, and `unknown` policy — instead of always deferring to
+/// `root_policy`. A subtree whose governing policy uses a strategy that
+/// doesn't support recursion (`Audio`/`Video`/`Photos`/`Documents`) still
+/// organizes its own direct entries under that strategy; it just never
+/// descends into its own children — the same boundary `cmd_organize`
+/// enforces at the top level, just possibly applied deeper in the tree.
+/// Reuses `plan_entry_with_strategy` per file — the identical per-entry
+/// dispatch Watch already relies on — so this, manual organize, and Watch
+/// can never quietly diverge on what one file's plan should be.
+fn plan_recursive_nested(
+    root: &Path,
+    root_policy: &EffectivePolicy,
+    builtin: &CategoryDB,
+) -> RecursivePlan {
+    let mut needed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut entry_actions: Vec<Action> = Vec::new();
+    let mut dirs_scanned = 0usize;
+    let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = pending.pop() {
+        let policy = match resolve_nested_policy_override(root, &dir) {
+            Some(Ok((p, _owner))) => p,
+            Some(Err(e)) => {
+                entry_actions.push(Action {
+                    src: dir.clone(),
+                    dst: None,
+                    op: Op::Skip,
+                    reason: Some(format!("invalid nested .sift.toml: {e}")),
+                    undoable: false,
+                });
+                continue;
+            }
+            None => root_policy.clone(),
+        };
+        dirs_scanned += 1;
+        let can_descend = policy.strategy.supports_recursive();
+
+        let mut children: Vec<PathBuf> = Vec::new();
+        for entry in scan_entries(&dir) {
+            if entry.is_dir {
+                let name = entry
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if let Some(reason) = crate::scanner::traversal_reason(&entry) {
+                    entry_actions.push(Action {
+                        src: entry.path.clone(),
+                        dst: None,
+                        op: Op::Skip,
+                        reason: Some(reason.into()),
+                        undoable: false,
+                    });
+                    continue;
+                }
+                if !can_descend {
+                    entry_actions.push(Action {
+                        src: entry.path.clone(),
+                        dst: None,
+                        op: Op::Skip,
+                        reason: Some(format!(
+                            "strategy = \"{}\" does not support recursive organize",
+                            policy.strategy.as_str()
+                        )),
+                        undoable: false,
+                    });
+                    continue;
+                }
+                if could_be_own_output_dir(&policy, name) {
+                    entry_actions.push(Action {
+                        src: entry.path.clone(),
+                        dst: None,
+                        op: Op::Skip,
+                        reason: Some("own organize destination directory".into()),
+                        undoable: false,
+                    });
+                    continue;
+                }
+                if policy.strategy == OrganizeStrategy::Date {
+                    let template = policy
+                        .template
+                        .as_ref()
+                        .expect("validated: Date always has a template");
+                    if template.component_could_be_generated(0, name) {
+                        entry_actions.push(Action {
+                            src: entry.path.clone(),
+                            dst: None,
+                            op: Op::Skip,
+                            reason: Some("date-organized directory".into()),
+                            undoable: false,
+                        });
+                        continue;
+                    }
+                }
+                children.push(entry.path.clone());
+                continue;
+            }
+            let entry_plan = plan_entry_with_strategy(&entry, &dir, &policy, builtin);
+            for a in entry_plan.create_dirs {
+                needed_dirs.insert(a.src);
+            }
+            entry_actions.push(entry_plan.action);
+        }
+        children.sort();
+        pending.extend(children);
+    }
+
+    let mut actions = createdir_actions(needed_dirs);
+    actions.extend(entry_actions);
+    RecursivePlan {
+        plan: Plan { actions },
+        dirs_scanned,
+    }
+}
+
+/// The recursive counterpart to `plan_with_strategy`: dispatches `root`'s
+/// own resolved policy the same way `plan_with_strategy` does, then walks
+/// the tree via `plan_recursive_nested`, which lets any subfolder's own
+/// local `.sift.toml` take over its own subtree instead of always
+/// deferring to `root`'s.
 pub fn plan_with_strategy_recursive(
     path: &str,
     policy: &EffectivePolicy,
     builtin: &CategoryDB,
 ) -> RecursivePlan {
-    match policy.strategy {
-        OrganizeStrategy::Type => {
-            plan_organize_recursive(path, &policy.rules, builtin, policy.unknown_policy)
-        }
-        OrganizeStrategy::Date => plan_organize_date_recursive(
-            path,
-            &policy.rules,
-            policy
-                .template
-                .as_ref()
-                .expect("validated: Date always has a template"),
-            policy
-                .date_source
-                .expect("validated: Date always has a date_source"),
-        ),
-        // `Audio`/`Video`/`Photos`/`Documents` never support `--recursive`
-        // (see `OrganizeStrategy::supports_recursive`) — `cmd_organize`
-        // already refuses to call this function for them, but this arm is
-        // defense in depth for any other caller, producing a clear,
-        // harmless all-skip plan instead of organizing anything.
-        OrganizeStrategy::Audio
-        | OrganizeStrategy::Video
-        | OrganizeStrategy::Photos
-        | OrganizeStrategy::Documents => RecursivePlan {
-            plan: skip_all(
-                &scan_entries(Path::new(path)),
-                "strategy does not support --recursive",
-            ),
+    let root = Path::new(path);
+    if is_project_root(root) {
+        return RecursivePlan {
+            plan: skip_all(&scan_entries(root), "target is a software project root"),
             dirs_scanned: 0,
-        },
+        };
     }
+    // `Audio`/`Video`/`Photos`/`Documents` never support `--recursive` at
+    // the root (see `OrganizeStrategy::supports_recursive`) — `cmd_organize`
+    // already refuses to call this function for them, but this is defense
+    // in depth for any other caller, producing a clear, harmless all-skip
+    // plan instead of organizing anything. A *nested* directory governed by
+    // one of these strategies is handled differently, inside
+    // `plan_recursive_nested` itself — it still organizes its own direct
+    // entries, just never descends further.
+    if !policy.strategy.supports_recursive() {
+        return RecursivePlan {
+            plan: skip_all(&scan_entries(root), "strategy does not support --recursive"),
+            dirs_scanned: 0,
+        };
+    }
+    plan_recursive_nested(root, policy, builtin)
 }
 
 fn resolve_clean_action(entry: &Entry, rules: &[&Rule]) -> Action {

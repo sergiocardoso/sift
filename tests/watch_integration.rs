@@ -1068,6 +1068,79 @@ fn real_notify_organizes_a_new_file_end_to_end() {
     });
 }
 
+#[test]
+fn real_notify_recursive_watch_uses_nested_local_sift_toml() {
+    // The core scenario this test guards: a recursive watch rooted at
+    // `root` must let `root/client/`'s own local `.sift.toml` govern files
+    // inside `client/`, instead of always applying `root`'s own resolved
+    // policy to everything under it regardless of depth.
+    let d = tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join("client")).unwrap();
+    fs::write(
+        root.join("client").join(".sift.toml"),
+        "[organize]\nstrategy = \"type\"\nunknown = \"skip\"\n",
+    )
+    .unwrap();
+
+    with_isolated_registry(|_reg_root| {
+        add(root.clone(), true, true).unwrap(); // recursive
+        transition(&root, WatchState::Running).unwrap();
+
+        with_isolated_history(&root, || {
+            let mut daemon = Daemon::new().unwrap();
+            daemon.reconcile();
+
+            // Root's own (default) policy is `unknown = "other"`; an
+            // unrecognized extension at the root must still land in
+            // `Other/`. `client/`'s own policy is `unknown = "skip"`; the
+            // identically-unrecognized file inside `client/` must stay
+            // put. Both are created only *after* the watcher attaches, per
+            // the "no backfill" rule.
+            let root_file = root.join("weird.xyzabc");
+            let nested_file = root.join("client").join("weird.xyzabc");
+            fs::write(&root_file, b"x").unwrap();
+            fs::write(&nested_file, b"x").unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut root_moved = false;
+            while Instant::now() < deadline {
+                daemon.reconcile();
+                daemon.drain_events(Duration::from_millis(100));
+                daemon.process_ready();
+                if root.join("Other/weird.xyzabc").exists() {
+                    root_moved = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                root_moved,
+                "expected root's own unknown=other policy to move the root-level file \
+                 within the timeout; the real OS filesystem watcher may be unavailable \
+                 in this environment"
+            );
+
+            // Give client/'s candidate the same stabilize-and-process
+            // treatment a few more ticks over, so a wrongly-applied
+            // root policy (which would have moved it to Other/ or
+            // client/Other/ by now) has every chance to show up.
+            for _ in 0..20 {
+                daemon.reconcile();
+                daemon.drain_events(Duration::from_millis(100));
+                daemon.process_ready();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            assert!(
+                nested_file.exists(),
+                "client/'s own unknown=skip policy must keep this file in place"
+            );
+            assert!(!root.join("client/Other/weird.xyzabc").exists());
+        });
+    });
+}
+
 /// Small local helper trait so tests can turn "a not-yet-existing directory
 /// path" into a real, canonical directory in one line.
 trait CanonicalizeDirExt {

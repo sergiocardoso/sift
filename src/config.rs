@@ -1251,10 +1251,6 @@ pub fn find_config(start: &str) -> Option<PathBuf> {
     None
 }
 
-fn local_config_path(root: &str) -> PathBuf {
-    PathBuf::from(root).join(".sift.toml")
-}
-
 // Test-only global config directory override, mirroring
 // `history::set_test_history_dir`/`watch::registry::set_test_watch_dir`:
 // never used in production, exists purely so tests (including the
@@ -1303,13 +1299,32 @@ fn global_config_path() -> Option<PathBuf> {
 /// the next level." A file that exists but fails to parse or validate
 /// always is.
 pub fn resolve_policy(root: &str) -> Result<EffectivePolicy, String> {
-    let local = local_config_path(root);
-    if local.is_file() {
+    if let Some(result) = local_policy_override(Path::new(root)) {
+        return result;
+    }
+    global_or_default_policy()
+}
+
+/// Whether `dir` has its own local `.sift.toml` — `None` means "no
+/// override here, inherit whatever policy already governs this subtree";
+/// `Some(Err(_))` means one exists but fails to parse/validate (fail-
+/// closed, exactly like `resolve_policy`'s local branch). Shared by
+/// `resolve_policy` (root only) and `resolve_nested_policy_override` (any
+/// directory, walking upward) so both read a local `.sift.toml` the same
+/// way.
+fn local_policy_override(dir: &Path) -> Option<Result<EffectivePolicy, String>> {
+    let local = dir.join(".sift.toml");
+    if !local.is_file() {
+        return None;
+    }
+    Some((|| {
         let text =
             std::fs::read_to_string(&local).map_err(|e| format!("{}: {e}", local.display()))?;
         let v = parse_and_validate(&text).map_err(|e| format!("{}: {e}", local.display()))?;
-        return Ok(EffectivePolicy {
-            source: PolicySource::Local { path: local },
+        Ok(EffectivePolicy {
+            source: PolicySource::Local {
+                path: local.clone(),
+            },
             version: v.version,
             strategy: v.strategy,
             unknown_policy: v.unknown_policy,
@@ -1318,9 +1333,13 @@ pub fn resolve_policy(root: &str) -> Result<EffectivePolicy, String> {
             metadata_template: v.metadata_template,
             stability: v.stability,
             rules: v.rules,
-        });
-    }
+        })
+    })())
+}
 
+/// The tail of `resolve_policy` once no local override applies: the global
+/// config file if present, else the built-in default.
+fn global_or_default_policy() -> Result<EffectivePolicy, String> {
     if let Some(global) = global_config_path() {
         if global.is_file() {
             let text = std::fs::read_to_string(&global)
@@ -1341,6 +1360,34 @@ pub fn resolve_policy(root: &str) -> Result<EffectivePolicy, String> {
     }
 
     Ok(EffectivePolicy::default())
+}
+
+/// The nested-`.sift.toml`-aware counterpart to `resolve_policy`, for a
+/// directory `dir` strictly under a recursive watch/organize root `root`
+/// (never `root` itself — the caller already has `root`'s own resolved
+/// policy in hand and must use exactly that, not a fresh, possibly
+/// diverging read of the same file). Lets a subfolder's own Smart Folder
+/// config take over its own subtree instead of always deferring to the
+/// root's: walks upward from `dir` (exclusive of `root`), directory by
+/// directory, and returns the first local `.sift.toml` found (closest
+/// wins) along with the directory that owns it.
+///
+/// `None` means no override exists anywhere between `dir` and `root` — the
+/// caller's own root policy governs `dir` exactly as it always did.
+/// `Some(Err(_))` means an override exists but fails to parse/validate
+/// (fail-closed, same as `resolve_policy`'s local branch).
+pub fn resolve_nested_policy_override(
+    root: &Path,
+    dir: &Path,
+) -> Option<Result<(EffectivePolicy, PathBuf), String>> {
+    let mut cur = dir.to_path_buf();
+    while cur != root {
+        if let Some(result) = local_policy_override(&cur) {
+            return Some(result.map(|policy| (policy, cur.clone())));
+        }
+        cur = cur.parent()?.to_path_buf();
+    }
+    None
 }
 
 // ----------------------------------------------------------------- init

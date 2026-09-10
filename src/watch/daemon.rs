@@ -340,6 +340,15 @@ impl Daemon {
     /// policy is currently invalid is skipped entirely — no candidate for
     /// it is ever moved, and none of its pending candidates can have
     /// survived to this point anyway (see `refresh_policy`).
+    ///
+    /// For a recursive watch, a candidate outside `root` itself is planned
+    /// against the *nearest* policy governing its containing directory
+    /// (`config::resolve_nested_policy_override`), not blindly against `root`'s own
+    /// cached policy — this is what lets a subfolder's own local
+    /// `.sift.toml` take over its own subtree. `root`'s cached policy still
+    /// decides the stability window for every candidate uniformly (a
+    /// per-directory debounce window is not worth the added complexity),
+    /// and still gates whether this root is watched at all.
     pub fn process_ready(&mut self) {
         let now = Instant::now();
         let unhealthy = self.unhealthy.clone();
@@ -360,7 +369,36 @@ impl Daemon {
                 continue;
             }
             for path in ready {
-                let outcome = process_candidate(root, policy, &builtin, &path);
+                let containing_dir = path.parent().unwrap_or(root.as_path());
+                let resolved;
+                let candidate_policy = if monitor.recursive && containing_dir != root.as_path() {
+                    match crate::config::resolve_nested_policy_override(root, containing_dir) {
+                        Some(Ok((p, owner))) => {
+                            // The owning directory's own strategy doesn't
+                            // support recursion, and this candidate lives
+                            // deeper than that directory — same boundary
+                            // `plan_recursive_nested` enforces for manual
+                            // recursive organize, applied here to one live
+                            // candidate instead of a whole tree walk.
+                            if !p.strategy.supports_recursive() && containing_dir != owner {
+                                continue;
+                            }
+                            resolved = p;
+                            &resolved
+                        }
+                        // An invalid nested `.sift.toml` fails closed for
+                        // just this one candidate — never the whole
+                        // (otherwise healthy) root, and never recorded as a
+                        // root-level error.
+                        Some(Err(_)) => continue,
+                        // No override anywhere between here and root: root's
+                        // own cached policy governs, exactly as before.
+                        None => policy,
+                    }
+                } else {
+                    policy
+                };
+                let outcome = process_candidate(root, candidate_policy, &builtin, &path);
                 if outcome.organized {
                     let _ = registry::record_success(root, 1);
                 } else if let Some(err) = &outcome.failure {

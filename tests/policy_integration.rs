@@ -292,12 +292,12 @@ fn recursive_uses_root_policy_for_every_nested_file() {
 }
 
 #[test]
-fn recursive_never_discovers_a_nested_local_sift_toml() {
-    // A nested directory's own `.sift.toml` (if one existed) must never be
-    // discovered or applied — the root's resolved policy governs the whole
-    // recursive operation. Simulate this by placing a nested `.sift.toml`
-    // and confirming it's simply skipped as an ordinary hidden file, never
-    // read as policy.
+fn recursive_lets_a_nested_local_sift_toml_govern_its_own_subtree() {
+    // A nested directory's own `.sift.toml`, if one exists, takes over its
+    // own subtree during a recursive operation — the root's resolved
+    // policy only governs directories that have no closer override of
+    // their own. Place a nested `.sift.toml` with `unknown = "skip"` and
+    // confirm a file inside it follows THAT policy, not the root's.
     let d = tempdir().unwrap();
     let t = d.path();
     fs::create_dir_all(t.join("client")).unwrap();
@@ -307,8 +307,8 @@ fn recursive_never_discovers_a_nested_local_sift_toml() {
     )
     .unwrap();
     fs::write(t.join("client").join("weird.xyzabc"), b"x").unwrap();
-    // Root policy says unknown -> other (default); if the nested file were
-    // (wrongly) discovered, this candidate would be Skip instead.
+    // Root policy says unknown -> other (default); the nested override
+    // must win for files inside `client/`.
     let rp = plan_with_strategy_recursive(
         t.to_str().unwrap(),
         &EffectivePolicy::default(),
@@ -322,9 +322,11 @@ fn recursive_never_discovers_a_nested_local_sift_toml() {
         .unwrap();
     assert_eq!(
         a.op,
-        Op::Move,
-        "root policy (unknown=other) must win, not the nested file"
+        Op::Skip,
+        "client/'s own local policy (unknown=skip) must win, not the root's"
     );
+    // The nested `.sift.toml` itself is still an ordinary hidden file,
+    // skipped as one, never moved.
     let hidden = rp
         .plan
         .actions
@@ -333,6 +335,179 @@ fn recursive_never_discovers_a_nested_local_sift_toml() {
         .unwrap();
     assert_eq!(hidden.op, Op::Skip);
     assert_eq!(hidden.reason.as_deref(), Some("hidden file"));
+}
+
+#[test]
+fn recursive_nested_local_sift_toml_can_switch_strategy() {
+    // A subfolder's own local `.sift.toml` can govern its subtree with a
+    // completely different strategy than the root's, not just different
+    // rules/unknown policy.
+    let d = tempdir().unwrap();
+    let t = d.path();
+    fs::create_dir_all(t.join("invoices")).unwrap();
+    fs::write(
+        t.join("invoices").join(".sift.toml"),
+        "[organize]\nstrategy = \"date\"\ntemplate = \"{year}/{month}\"\ndate_source = \"modified\"\n",
+    )
+    .unwrap();
+    let pdf = t.join("invoices").join("one.pdf");
+    fs::write(&pdf, b"x").unwrap();
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let dm = sift::config::DateMetadata::from_unix_secs(now_secs);
+    let expected = t
+        .join("invoices")
+        .join(format!("{:04}/{:02}/one.pdf", dm.year, dm.month));
+
+    // Root's own policy stays `type` (the default) — an unrelated
+    // root-level file must still be classified by it, proving the root
+    // wasn't itself switched to `date`.
+    fs::write(t.join("readme.txt"), b"x").unwrap();
+
+    let rp = plan_with_strategy_recursive(
+        t.to_str().unwrap(),
+        &EffectivePolicy::default(),
+        &CategoryDB::default(),
+    );
+    let invoice = rp.plan.actions.iter().find(|a| a.src == pdf).unwrap();
+    assert_eq!(
+        invoice.op,
+        Op::Move,
+        "invoices/'s own date strategy must govern its file"
+    );
+    assert_eq!(invoice.dst.as_ref().unwrap(), &expected);
+
+    let readme = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("readme.txt"))
+        .unwrap();
+    assert_eq!(readme.op, Op::Move);
+    assert_eq!(
+        readme.dst.as_ref().unwrap(),
+        &t.join("Documents/readme.txt")
+    );
+}
+
+#[test]
+fn recursive_nested_non_recursive_strategy_organizes_directly_but_does_not_descend() {
+    // A subfolder governed by a strategy that never supports `--recursive`
+    // on its own (audio/video/photos/documents) still organizes its own
+    // direct entries under that strategy when reached via a recursive
+    // walk from an ancestor — it just never descends into its own
+    // children, the same boundary `cmd_organize` enforces at the top
+    // level, applied here one level down.
+    let d = tempdir().unwrap();
+    let t = d.path();
+    fs::create_dir_all(t.join("music").join("deeper")).unwrap();
+    fs::write(
+        t.join("music").join(".sift.toml"),
+        "[organize]\nstrategy = \"audio\"\ntemplate = \"{artist}/{album}\"\n",
+    )
+    .unwrap();
+    // Not a real, tag-bearing audio file — metadata extraction will fail,
+    // but that in itself proves `music/`'s own audio strategy actually ran
+    // (a `type`-strategy skip would look different), which is all this
+    // test needs.
+    fs::write(t.join("music").join("fake.mp3"), b"not really audio").unwrap();
+    fs::write(t.join("music/deeper").join("also.mp3"), b"not really audio").unwrap();
+
+    let rp = plan_with_strategy_recursive(
+        t.to_str().unwrap(),
+        &EffectivePolicy::default(),
+        &CategoryDB::default(),
+    );
+
+    let fake = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("music/fake.mp3"))
+        .unwrap();
+    assert_eq!(fake.op, Op::Skip);
+    assert_ne!(
+        fake.reason.as_deref(),
+        Some("unknown type"),
+        "music/fake.mp3 must be classified by audio's own metadata rules, not type's"
+    );
+
+    let deeper = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("music/deeper"))
+        .unwrap();
+    assert_eq!(deeper.op, Op::Skip);
+    assert_eq!(
+        deeper.reason.as_deref(),
+        Some("strategy = \"audio\" does not support recursive organize")
+    );
+    assert!(
+        !rp.plan.actions.iter().any(|a| a.src.ends_with("also.mp3")),
+        "music/deeper/ must never be entered — its file must not appear in the plan at all"
+    );
+}
+
+#[test]
+fn recursive_never_reenters_a_custom_rule_destination_directory() {
+    // `strategy = "type"`'s reserved category names (Documents/Images/...)
+    // already protect themselves from being re-entered and reclassified a
+    // second time (`scanner::is_sift_category_dir`); a custom `[[rules]]`
+    // `Move` destination has no such built-in reservation, so recursive
+    // traversal needs to recognize it structurally instead
+    // (`planner::could_be_own_output_dir`) — the same gap a nested
+    // `.sift.toml`'s own custom destination names would otherwise fall
+    // into.
+    let d = tempdir().unwrap();
+    let t = d.path();
+    fs::create_dir_all(t.join("Invoices")).unwrap();
+    fs::write(t.join("Invoices").join("already-here.pdf"), b"x").unwrap();
+    fs::write(t.join("new.pdf"), b"x").unwrap();
+    let policy = EffectivePolicy {
+        rules: vec![sift::config::Rule {
+            name: String::new(),
+            pattern: "*.pdf".into(),
+            action: "Move".into(),
+            destination: Some("Invoices".into()),
+            priority: 100,
+            enabled: true,
+            description: None,
+        }],
+        ..EffectivePolicy::default()
+    };
+    let rp = plan_with_strategy_recursive(t.to_str().unwrap(), &policy, &CategoryDB::default());
+
+    assert!(
+        !rp.plan
+            .actions
+            .iter()
+            .any(|a| a.src.ends_with("Invoices/already-here.pdf")),
+        "a file already correctly placed in the rule's own destination directory must never be replanned"
+    );
+    let new_pdf = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("new.pdf"))
+        .unwrap();
+    assert_eq!(new_pdf.op, Op::Move);
+    assert_eq!(new_pdf.dst.as_ref().unwrap(), &t.join("Invoices/new.pdf"));
+
+    let invoices_dir = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src == t.join("Invoices"))
+        .unwrap();
+    assert_eq!(invoices_dir.op, Op::Skip);
+    assert_eq!(
+        invoices_dir.reason.as_deref(),
+        Some("own organize destination directory")
+    );
 }
 
 // ------------------------------------------------------------------ explain
