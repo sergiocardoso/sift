@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.2.2] - 2026-09-10
+- Fixed `release.yml`: the Linux `sift-tray` build was also missing `libxdo-dev` (needed by the native folder picker), so it failed to link even after the v0.2.1 package fix. Documented the full Linux build dependency list. No other changes.
+
 ## [v0.2.1] - 2026-09-10
 - Fixed `release.yml`: the new `sift-tray` release job was building against the wrong package (root `sift` instead of the `sift-tray` workspace member), so no `sift-tray` archives were actually published on v0.2.0. No other changes.
 

@@ -255,7 +255,7 @@ cargo build -p sift-tray --release
 ./target/release/sift-tray
 ```
 
-On Linux this needs GTK3 + an AppIndicator implementation (`libayatana-appindicator3` or `libappindicator3`) available at build time — install your distro's `-dev`/`-devel` packages for those if the build fails. There's no autostart/packaging yet (no `.app` bundle, no Windows startup entry, no Linux `.desktop` autostart) — for now it's just "run the binary".
+On Linux this needs GTK3, an AppIndicator implementation, and `libxdo` (used by the native folder picker) available at build time — e.g. on Debian/Ubuntu: `sudo apt-get install libgtk-3-dev libayatana-appindicator3-dev libxdo-dev` (older distros: `libappindicator3-dev` instead of the `ayatana` package). There's no autostart/packaging yet (no `.app` bundle, no Windows startup entry, no Linux `.desktop` autostart) — for now it's just "run the binary".
 
 ### Auto-launched by `sift watch start`, best-effort
 
