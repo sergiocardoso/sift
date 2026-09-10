@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.3.0] - 2026-09-10
+- Any command may now print a one-line, best-effort notice (to stderr, never stdout/`--json`) when a newer `sift` release is available on GitHub. Checked in a fully detached background process, at most once every 24 hours, via `curl` (never blocks or slows down the command that triggered it). Set `SIFT_NO_UPDATE_CHECK` to disable entirely.
+
 ## [v0.2.2] - 2026-09-10
 - Fixed `release.yml`: the Linux `sift-tray` build was also missing `libxdo-dev` (needed by the native folder picker), so it failed to link even after the v0.2.1 package fix. Documented the full Linux build dependency list. No other changes.
 

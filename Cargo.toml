@@ -8,7 +8,7 @@ members = ["sift-tray"]
 
 [package]
 name = "sift"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 authors = ["Sérgio Cardoso"]
 description = "Local-first, safe CLI for cleaning and organizing files."

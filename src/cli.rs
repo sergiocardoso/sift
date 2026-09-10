@@ -205,6 +205,12 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Internal: performs one GitHub Releases check and refreshes the
+    /// local update-notice cache. Spawned detached, at most once a day,
+    /// by every other command (see `update_check`) — never meant to be
+    /// run directly in a terminal, and hidden from `--help` accordingly.
+    #[command(hide = true, name = "__update-check")]
+    UpdateCheckInternal,
 }
 
 #[derive(Subcommand)]
@@ -299,7 +305,17 @@ pub enum DaemonCommands {
 
 pub fn run() -> std::process::ExitCode {
     let cli = Cli::parse();
-    dispatch(cli)
+    // The hidden internal check is itself dispatched below; it must never
+    // be wrapped in the calls that spawn/print around it, or it would
+    // recursively spawn (and needlessly print a stderr notice around)
+    // itself.
+    if matches!(cli.command, Some(Commands::UpdateCheckInternal)) {
+        return dispatch(cli);
+    }
+    crate::update_check::spawn_background_check_if_due();
+    let code = dispatch(cli);
+    crate::update_check::print_notice_if_cached();
+    code
 }
 
 fn exit_code(ok: bool) -> std::process::ExitCode {
@@ -385,6 +401,7 @@ pub fn dispatch(cli: Cli) -> std::process::ExitCode {
         Commands::Explain { file, root, json } => {
             exit_code(crate::explain::cmd_explain(file, root, json))
         }
+        Commands::UpdateCheckInternal => crate::update_check::run_hidden_check(),
     }
 }
 

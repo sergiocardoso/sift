@@ -240,6 +240,14 @@ Then:
 sift --help
 ```
 
+## Update notices
+
+Sift is otherwise local-first and makes no network calls of its own. The one exception: any command may check, in the background, whether a newer release is available on GitHub, and print a one-line notice — to stderr, never stdout, so it can never land inside `--json` output — if so.
+
+This is built to never add latency or noise to a normal command: the check itself never runs inline. A small local cache file tracks when it last ran; at most once every 24 hours, a command spawns a fully detached background process to do the actual (3-second-timeout) network call via `curl` and update the cache — the command that triggered it never waits on it, so a slow or unreachable network never slows anything down, and the notice (if any) only starts showing up starting with the *next* command. If `curl` isn't installed, the check just silently never succeeds — same as everywhere else Sift shells out to an optional external tool.
+
+Set `SIFT_NO_UPDATE_CHECK` (to any value) to disable this entirely — no network call, and no notice printed even from an already-cached result.
+
 ## Optional: `sift-tray` (system tray / menu bar UI)
 
 A small, entirely separate app that shows an icon near the clock (macOS menu bar, Windows/Linux tray) listing your watched folders — name, state (running/paused/stopped/config error), with "Open folder" and "Pause"/"Resume" per watch. It's a thin UI shell over the same `sift` library the CLI uses (`watch::registry::list`, the same `cmd_watch_pause`/`cmd_watch_resume` functions `sift watch pause`/`resume` call) — it never talks to the watch daemon directly and never reimplements any watch logic.

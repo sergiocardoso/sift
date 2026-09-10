@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod planner;
 pub mod render;
 pub mod scanner;
+pub mod update_check;
 pub mod utils;
 pub mod watch;
 

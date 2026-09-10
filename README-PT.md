@@ -240,6 +240,14 @@ Depois:
 sift --help
 ```
 
+## Avisos de atualização
+
+O Sift é local-first fora isso, e não faz nenhuma chamada de rede por conta própria. A única exceção: qualquer comando pode checar, em background, se existe uma release mais nova no GitHub, e imprimir um aviso de uma linha — no stderr, nunca no stdout, então nunca entra na saída de `--json` — se tiver.
+
+Isso é construído pra nunca adicionar latência ou ruído a um comando normal: a checagem em si nunca roda inline. Um pequeno arquivo de cache local guarda quando foi a última vez que rodou; no máximo uma vez a cada 24 horas, um comando lança um processo em background totalmente destacado pra fazer a chamada de rede de verdade (timeout de 3 segundos) via `curl` e atualizar o cache — o comando que disparou isso nunca espera por ele, então uma rede lenta ou inacessível nunca deixa nada mais lento, e o aviso (se houver) só começa a aparecer a partir do *próximo* comando. Se o `curl` não estiver instalado, a checagem simplesmente nunca funciona, silenciosamente — igual em todo outro lugar onde o Sift chama uma ferramenta externa opcional.
+
+Defina `SIFT_NO_UPDATE_CHECK` (com qualquer valor) pra desligar isso completamente — sem chamada de rede, e sem aviso impresso mesmo de um resultado já em cache.
+
 ## Opcional: `sift-tray` (UI de bandeja/menu bar)
 
 Um app pequeno e totalmente separado que mostra um ícone perto do relógio (menu bar no macOS, bandeja no Windows/Linux) listando suas pastas monitoradas — nome, estado (rodando/pausado/parado/com erro de config), com "Abrir pasta" e "Pausar"/"Retomar" por watch. É uma camada de UI fina sobre a mesma biblioteca `sift` que o CLI usa (`watch::registry::list`, as mesmas funções `cmd_watch_pause`/`cmd_watch_resume` que `sift watch pause`/`resume` chamam) — nunca fala com o daemon do watch diretamente e nunca reimplementa lógica de watch.
