@@ -1,5 +1,8 @@
 # Changelog
 
+## [Unreleased]
+- `install.sh` now offers to install `sift-tray` too (when a prebuilt archive exists for the detected platform), interactively and opt-in only — same "never silently, never non-interactively" rule as the existing ffmpeg offer. Doesn't affect a non-interactive `curl | sh` install, which still installs only `sift`.
+
 ## [v0.4.0] - 2026-09-10
 - `sift-tray`'s "Add folder…" now runs one `sift organize --apply` pass on the folder's pre-existing files before starting the watch, instead of leaving them untouched until something new lands (which is still exactly what `sift watch add` on the CLI does — this only changes the tray's one-click flow).
 

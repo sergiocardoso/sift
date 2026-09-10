@@ -109,6 +109,74 @@ case ":$PATH:" in
     ;;
 esac
 
+# --------------------------------------------------- optional: sift-tray
+
+# Only these targets have a published sift-tray archive (see
+# .github/workflows/release.yml's upload-tray-assets job) — no Linux
+# aarch64 (GTK cross-compile isn't set up for it yet) and no Windows.
+case "$target" in
+  x86_64-unknown-linux-gnu | x86_64-apple-darwin | aarch64-apple-darwin)
+    say ""
+    say "sift-tray is a small, optional system tray / menu bar app that shows"
+    say "an icon for your watched folders (Open folder, Pause/Resume, Add"
+    say "folder...). sift itself works fully without it."
+    # Same rule as the ffmpeg offer below: only ever ask in a real
+    # interactive terminal, and only act on an explicit yes — never in a
+    # non-interactive \`curl | sh\` pipe, and never silently.
+    if [ -t 0 ] && [ -t 1 ]; then
+      printf "Install sift-tray too? [y/N] "
+      read -r tray_answer
+    else
+      tray_answer="n"
+      say "(Running non-interactively, so not installing it automatically."
+      say "See the README's \"Optional: sift-tray\" section to do it later.)"
+    fi
+    case "$tray_answer" in
+      y | Y | yes | YES)
+        tray_bin="${BIN_NAME}-tray"
+        tray_archive="${tray_bin}-${target}.tar.gz"
+        tray_checksum_file="${tray_bin}-${target}.sha256"
+        say "Downloading ${tray_archive}..."
+        if curl -fsSL -o "${tmp_dir}/${tray_archive}" "${base_url}/${tray_archive}" \
+          && curl -fsSL -o "${tmp_dir}/${tray_checksum_file}" "${base_url}/${tray_checksum_file}"; then
+          say "Verifying checksum..."
+          tray_verified=0
+          if (
+            cd "$tmp_dir"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum -c "$tray_checksum_file"
+            elif command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 -c "$tray_checksum_file"
+            else
+              exit 1
+            fi
+          ); then
+            tray_verified=1
+          fi
+          if [ "$tray_verified" = 1 ]; then
+            tar -xzf "${tmp_dir}/${tray_archive}" -C "$tmp_dir" "$tray_bin"
+            chmod +x "${tmp_dir}/${tray_bin}"
+            mv "${tmp_dir}/${tray_bin}" "${INSTALL_DIR}/${tray_bin}"
+            say "Installed ${INSTALL_DIR}/${tray_bin}"
+            say "\`sift watch start\` will launch it automatically from now on."
+          else
+            say "sift-tray checksum verification failed — skipped installing it."
+            say "sift itself is unaffected; installed normally above."
+          fi
+        else
+          say "Could not download sift-tray for $target — skipped."
+          say "sift itself is unaffected; installed normally above."
+        fi
+        ;;
+      *)
+        if [ -t 0 ] && [ -t 1 ]; then
+          say "Skipped. See the README's \"Optional: sift-tray\" section to install it later."
+        fi
+        ;;
+    esac
+    ;;
+esac
+
 # ---------------------------------------------------- optional: ffprobe
 
 say ""
