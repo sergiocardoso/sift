@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.4.0] - 2026-09-10
+- `sift-tray`'s "Add folder…" now runs one `sift organize --apply` pass on the folder's pre-existing files before starting the watch, instead of leaving them untouched until something new lands (which is still exactly what `sift watch add` on the CLI does — this only changes the tray's one-click flow).
+
 ## [v0.3.0] - 2026-09-10
 - Any command may now print a one-line, best-effort notice (to stderr, never stdout/`--json`) when a newer `sift` release is available on GitHub. Checked in a fully detached background process, at most once every 24 hours, via `curl` (never blocks or slows down the command that triggered it). Set `SIFT_NO_UPDATE_CHECK` to disable entirely.
 

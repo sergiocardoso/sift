@@ -140,6 +140,30 @@ fn main() {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                                 let path_str = folder.to_string_lossy().to_string();
                                 if sift::watch::cmd_watch_add(path_str.clone(), true, false) {
+                                    // Watch itself never sweeps pre-existing
+                                    // files once started — by design, it
+                                    // only ever reacts to filesystem events
+                                    // from here on (see `watch`'s own
+                                    // module docs). Picking a folder in this
+                                    // dialog is this app's one deliberate
+                                    // authorization gesture (same contract
+                                    // as `--auto-apply` on the CLI), so —
+                                    // unlike `sift watch add` on the CLI,
+                                    // which leaves this to a separate
+                                    // explicit `sift organize --apply` —
+                                    // run one real organize pass on
+                                    // whatever's already there before
+                                    // starting the watch, so a folder full
+                                    // of existing files doesn't sit
+                                    // unorganized until something new
+                                    // happens to land in it.
+                                    sift::planner::cmd_organize(
+                                        path_str.clone(),
+                                        true,
+                                        false,
+                                        false,
+                                        false,
+                                    );
                                     sift::watch::cmd_watch_start(path_str);
                                 }
                             }
