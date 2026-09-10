@@ -58,7 +58,8 @@ target="${arch_part}-${os_part}"
 
 say "Resolving the latest sift release..."
 api_url="${SIFT_API_URL:-https://api.github.com/repos/${REPO}/releases/latest}"
-tag="$(curl -fsSL "$api_url" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+api_response="$(curl -fsSL "$api_url")" || die "could not resolve the latest sift release from $api_url"
+tag="$(printf '%s\n' "$api_response" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
 [ -n "$tag" ] || die "could not resolve the latest sift release from $api_url"
 say "Latest release: $tag"
 
