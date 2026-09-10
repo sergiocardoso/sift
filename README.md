@@ -244,7 +244,11 @@ sift --help
 
 A small, entirely separate app that shows an icon near the clock (macOS menu bar, Windows/Linux tray) listing your watched folders — name, state (running/paused/stopped/config error), with "Open folder" and "Pause"/"Resume" per watch. It's a thin UI shell over the same `sift` library the CLI uses (`watch::registry::list`, the same `cmd_watch_pause`/`cmd_watch_resume` functions `sift watch pause`/`resume` call) — it never talks to the watch daemon directly and never reimplements any watch logic.
 
-It lives in its own workspace package specifically so installing/building the `sift` CLI never pulls in GUI dependencies (GTK on Linux, etc.):
+It lives in its own workspace package specifically so installing/building the `sift` CLI never pulls in GUI dependencies (GTK on Linux, etc.).
+
+Each [GitHub Release](https://github.com/sergiocardoso/sift/releases) includes a prebuilt `sift-tray` archive for Linux (x86_64) and macOS (x86_64/aarch64) alongside `sift` itself — download and extract it next to your installed `sift` binary (e.g. `~/.local/bin`), same as you would with any other release archive. `install.sh` doesn't fetch it automatically yet, so this is a manual step for now. There's no prebuilt Linux aarch64 archive yet (see [Contributing](#contributing) if you'd like to help with cross-compiling GTK for that target), and no Windows build at all — see [Platform support](#platform-support).
+
+Or build it yourself from source:
 
 ```bash
 cargo build -p sift-tray --release
@@ -252,6 +256,12 @@ cargo build -p sift-tray --release
 ```
 
 On Linux this needs GTK3 + an AppIndicator implementation (`libayatana-appindicator3` or `libappindicator3`) available at build time — install your distro's `-dev`/`-devel` packages for those if the build fails. There's no autostart/packaging yet (no `.app` bundle, no Windows startup entry, no Linux `.desktop` autostart) — for now it's just "run the binary".
+
+### Auto-launched by `sift watch start`, best-effort
+
+Once `sift-tray` is installed (downloaded from a release or built from source, per above) and it's next to `sift` in the same directory, or anywhere on `PATH`, `sift watch start`/`sift watch resume` try to launch it automatically, detached, in the background — no separate step needed after that.
+
+This is entirely best-effort and silent either way: if the `sift-tray` binary isn't installed (the common case, since it's still a manual download even now that it's released), if there's no display server (a headless server, a container, a CI run), or if a `sift-tray` instance is already running, `watch start` still succeeds exactly the same and never prints a warning about it. Only one `sift-tray` instance is ever running at a time (a singleton lock, same mechanism as the watch daemon's own), so starting several watches in a row never opens several tray icons.
 
 ---
 
@@ -943,6 +953,10 @@ The detached background Watch daemon is currently implemented for Unix-like plat
 
 On unsupported platforms, Sift reports an explicit error instead of pretending that background Watch is running.
 
+#### Windows
+
+There's no official Windows build (`install.sh` and the GitHub release only cover Linux and macOS). That said, everything except `sift watch` is written against portable `std::fs` APIs and the cross-platform `trash` crate, and the whole workspace does cross-compile cleanly for `x86_64-pc-windows-gnu` — `scan`/`organize`/`clean`/`doctor`/`history`/`undo`/`init`/`folders`/`config`/`explain` are expected to work if you build from source, though this has never been run on real Windows and isn't covered by CI. `sift watch` specifically won't: the daemon spawn in `watch::platform` is intentionally Unix-only (see above), so a native Windows build of the daemon needs real process-detachment work (`CREATE_NEW_PROCESS_GROUP`/`DETACHED_PROCESS`) that hasn't been done or tested on a Windows machine yet.
+
 ---
 
 # Why Watch waits before moving a new file
@@ -1268,6 +1282,64 @@ Supported placeholders: `{author}`, `{title}`, `{year}`, `{month}`, `{day}` (the
 
 If a file is missing a tag/field the template references (an untagged mp3, a photo with no EXIF data, a PDF with no `/Info` dictionary), that file is **skipped** with a clear reason — Sift never invents a fallback bucket like `Unknown Artist/`. Run `sift explain <file>` to see exactly which field was unavailable.
 
+## Walkthrough: a different strategy per folder
+
+`.sift.toml` lives inside the directory it governs (`PATH/.sift.toml` — see [Configuration lookup](#configuration-lookup) below), not in one central file. That means each top-level folder you organize can run its own, independent strategy — your music library by tags, your photo library by camera/date, your PDFs by author, all at the same time:
+
+```text
+~/Music/.sift.toml       strategy = "audio"      → {artist}/{album}
+~/Pictures/.sift.toml    strategy = "photos"     → {camera}/{year}/{month}
+~/Documents/.sift.toml   strategy = "documents"  → {author}/{year}
+~/Downloads/.sift.toml   strategy = "type"       → built-in Documents/Images/Audio/... (or no file at all)
+```
+
+Set one up end to end. Generate a starter file:
+
+```bash
+sift init ~/Music
+```
+
+Replace the generated `[[rules]]` example in `~/Music/.sift.toml` with:
+
+```toml
+[organize]
+strategy = "audio"
+template = "{artist}/{album}"
+```
+
+Preview the plan, then apply it:
+
+```bash
+sift organize ~/Music
+sift organize ~/Music --apply
+```
+
+Before:
+
+```text
+~/Music/
+├── 01 Track One.mp3
+├── 02 Track Two.mp3
+└── live_bootleg.flac
+```
+
+After — destinations come from each file's own tags, never the filename:
+
+```text
+~/Music/
+├── Daft Punk/
+│   └── Discovery/
+│       ├── 01 Track One.mp3
+│       └── 02 Track Two.mp3
+└── Radiohead/
+    └── I Might Be Wrong/
+        └── live_bootleg.flac
+```
+
+A file missing the `{artist}`/`{album}` tag is skipped, not dropped into a guessed folder — run `sift explain ~/Music/live_bootleg.flac` beforehand to see exactly which tag would be used or missing.
+
+The same `sift init <dir>` → edit `.sift.toml` → `sift organize <dir> --apply` pattern applies to `~/Pictures` (`strategy = "photos"`, e.g. `template = "{camera}/{year}/{month}"`) and `~/Documents` (`strategy = "documents"`, e.g. `template = "{author}/{year}"`). Each directory's policy only ever affects files inside that directory.
+
 ## `audio`/`video`/`photos`/`documents` don't support `--recursive` yet
 
 Unlike `date`'s fixed-width `{year}`/`{month}`/`{day}`, an `{artist}`, `{camera}`, or `{author}` value is free text — structurally indistinguishable from any other folder name. That means there's currently no safe way to detect "this directory was generated by this same policy" and avoid re-entering it on a second run. `sift organize --recursive` and `sift watch add --recursive` both refuse `strategy = "audio"`/`"video"`/`"photos"`/`"documents"` with a clear error instead of guessing; a plain (non-recursive) `sift organize` and non-recursive `sift watch` work normally.
@@ -1416,6 +1488,10 @@ sift init ~/Downloads
 $EDITOR ~/Downloads/.sift.toml
 sift organize ~/Downloads
 ```
+
+## Organize a library by its own metadata (music, photos, documents...)
+
+Each folder's `.sift.toml` is independent, so `~/Music`, `~/Pictures`, and `~/Documents` can each run a different metadata-based `strategy` (tags, EXIF, document properties) at the same time — see [Walkthrough: a different strategy per folder](#walkthrough-a-different-strategy-per-folder) for the full example.
 
 ## Turn an Inbox into a Smart Inbox
 

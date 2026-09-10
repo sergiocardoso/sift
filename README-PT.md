@@ -244,7 +244,11 @@ sift --help
 
 Um app pequeno e totalmente separado que mostra um ícone perto do relógio (menu bar no macOS, bandeja no Windows/Linux) listando suas pastas monitoradas — nome, estado (rodando/pausado/parado/com erro de config), com "Abrir pasta" e "Pausar"/"Retomar" por watch. É uma camada de UI fina sobre a mesma biblioteca `sift` que o CLI usa (`watch::registry::list`, as mesmas funções `cmd_watch_pause`/`cmd_watch_resume` que `sift watch pause`/`resume` chamam) — nunca fala com o daemon do watch diretamente e nunca reimplementa lógica de watch.
 
-Vive no seu próprio pacote de workspace especificamente pra que instalar/compilar o CLI `sift` nunca puxe dependências gráficas (GTK no Linux etc.):
+Vive no seu próprio pacote de workspace especificamente pra que instalar/compilar o CLI `sift` nunca puxe dependências gráficas (GTK no Linux etc.).
+
+Cada [Release do GitHub](https://github.com/sergiocardoso/sift/releases) já inclui um arquivo `sift-tray` pré-compilado pra Linux (x86_64) e macOS (x86_64/aarch64) ao lado do próprio `sift` — baixe e extraia ao lado do seu `sift` já instalado (ex: `~/.local/bin`), do mesmo jeito que qualquer outro arquivo de release. O `install.sh` ainda não baixa isso automaticamente, então por enquanto é um passo manual. Ainda não tem arquivo pré-compilado pra Linux aarch64 (veja [Contributing](#contributing) se quiser ajudar com cross-compile de GTK pra esse alvo), e não tem build pra Windows nenhuma — veja [Suporte de plataforma](#suporte-de-plataforma).
+
+Ou compile você mesmo a partir do código-fonte:
 
 ```bash
 cargo build -p sift-tray --release
@@ -252,6 +256,12 @@ cargo build -p sift-tray --release
 ```
 
 No Linux isso precisa de GTK3 + uma implementação de AppIndicator (`libayatana-appindicator3` ou `libappindicator3`) disponíveis na hora de compilar — instale os pacotes `-dev`/`-devel` da sua distro se a build falhar. Ainda não tem autostart/empacotamento (sem `.app` no macOS, sem entrada de inicialização no Windows, sem autostart via `.desktop` no Linux) — por enquanto é só "rode o binário".
+
+### Lançado automaticamente pelo `sift watch start`, best-effort
+
+Depois que o `sift-tray` estiver instalado (baixado de uma release ou compilado a partir do código-fonte, conforme acima) e ele estiver ao lado do `sift` no mesmo diretório, ou em qualquer lugar do `PATH`, `sift watch start`/`sift watch resume` tentam lançá-lo automaticamente, destacado, em background — sem precisar de um passo separado depois disso.
+
+Isso é inteiramente best-effort e silencioso em qualquer caso: se o binário `sift-tray` não estiver instalado (o caso comum, já que ainda é um download manual mesmo agora que está na release), se não houver servidor de display (um servidor headless, um container, uma execução de CI), ou se já houver uma instância do `sift-tray` rodando, o `watch start` continua funcionando normalmente e nunca imprime um aviso sobre isso. Só existe uma instância do `sift-tray` rodando por vez (um lock de singleton, mesmo mecanismo do próprio daemon de watch), então iniciar vários watches em sequência nunca abre vários ícones de bandeja.
 
 ---
 
@@ -943,6 +953,10 @@ O daemon em segundo plano do Watch está atualmente implementado para plataforma
 
 Em plataformas não suportadas, o Sift relata um erro explícito em vez de fingir que o Watch em segundo plano está em execução.
 
+#### Windows
+
+Não existe build oficial pra Windows (o `install.sh` e a release do GitHub só cobrem Linux e macOS). Dito isso, tudo exceto o `sift watch` é escrito sobre APIs portáveis do `std::fs` e a crate cross-platform `trash`, e o workspace inteiro compila limpo pra `x86_64-pc-windows-gnu` — `scan`/`organize`/`clean`/`doctor`/`history`/`undo`/`init`/`folders`/`config`/`explain` devem funcionar se você compilar a partir do código-fonte, embora isso nunca tenha rodado num Windows de verdade e não esteja coberto por CI. O `sift watch` especificamente não vai funcionar: o spawn do daemon em `watch::platform` é intencionalmente Unix-only (veja acima), então um build nativo do daemon pra Windows precisa de trabalho real de detach de processo (`CREATE_NEW_PROCESS_GROUP`/`DETACHED_PROCESS`) que ainda não foi feito nem testado numa máquina Windows.
+
 ---
 
 # Por que o Watch espera antes de mover um novo arquivo
@@ -1268,6 +1282,64 @@ Placeholders suportados: `{author}`, `{title}`, `{year}`, `{month}`, `{day}` (a 
 
 Se um arquivo não tem uma tag/campo que o template referencia (um mp3 sem tag, uma foto sem dado EXIF, um PDF sem dicionário `/Info`), esse arquivo é **ignorado (skip)** com um motivo claro — o Sift nunca inventa uma pasta de fallback como `Unknown Artist/`. Rode `sift explain <arquivo>` para ver exatamente qual campo estava indisponível.
 
+## Passo a passo: uma estratégia diferente por pasta
+
+O `.sift.toml` mora dentro do diretório que ele governa (`PATH/.sift.toml` — veja [Configuration lookup](#configuration-lookup) mais abaixo), não em um arquivo central único. Isso significa que cada pasta de nível superior que você organiza pode rodar sua própria estratégia, independente das outras — sua biblioteca de música por tag, seu acervo de fotos por câmera/data, seus PDFs por autor, tudo ao mesmo tempo:
+
+```text
+~/Music/.sift.toml       strategy = "audio"      → {artist}/{album}
+~/Pictures/.sift.toml    strategy = "photos"     → {camera}/{year}/{month}
+~/Documents/.sift.toml   strategy = "documents"  → {author}/{year}
+~/Downloads/.sift.toml   strategy = "type"       → Documents/Images/Audio/... padrão (ou nenhum arquivo)
+```
+
+Configure uma do início ao fim. Gere um arquivo inicial:
+
+```bash
+sift init ~/Music
+```
+
+Substitua o exemplo de `[[rules]]` gerado em `~/Music/.sift.toml` por:
+
+```toml
+[organize]
+strategy = "audio"
+template = "{artist}/{album}"
+```
+
+Pré-visualize o plano e depois aplique:
+
+```bash
+sift organize ~/Music
+sift organize ~/Music --apply
+```
+
+Antes:
+
+```text
+~/Music/
+├── 01 Track One.mp3
+├── 02 Track Two.mp3
+└── live_bootleg.flac
+```
+
+Depois — os destinos vêm das tags de cada arquivo, nunca do nome do arquivo:
+
+```text
+~/Music/
+├── Daft Punk/
+│   └── Discovery/
+│       ├── 01 Track One.mp3
+│       └── 02 Track Two.mp3
+└── Radiohead/
+    └── I Might Be Wrong/
+        └── live_bootleg.flac
+```
+
+Um arquivo sem a tag `{artist}`/`{album}` é ignorado (skip), nunca jogado numa pasta chutada — rode `sift explain ~/Music/live_bootleg.flac` antes para ver exatamente qual tag seria usada ou está faltando.
+
+O mesmo padrão `sift init <pasta>` → editar `.sift.toml` → `sift organize <pasta> --apply` vale para `~/Pictures` (`strategy = "photos"`, ex: `template = "{camera}/{year}/{month}"`) e `~/Documents` (`strategy = "documents"`, ex: `template = "{author}/{year}"`). A política de cada diretório só afeta os arquivos dentro dele.
+
 ## `audio`/`video`/`photos`/`documents` ainda não suportam `--recursive`
 
 Diferente dos placeholders de largura fixa `{year}`/`{month}`/`{day}` do `date`, um valor de `{artist}`, `{camera}` ou `{author}` é texto livre — estruturalmente indistinguível de qualquer outro nome de pasta. Isso significa que hoje não há como detectar com segurança "esse diretório foi gerado por esta mesma política" e evitar reentrar nele numa segunda execução. Tanto `sift organize --recursive` quanto `sift watch add --recursive` recusam `strategy = "audio"`/`"video"`/`"photos"`/`"documents"` com um erro claro em vez de arriscar; um `sift organize` simples (não recursivo) e um `sift watch` não recursivo funcionam normalmente.
@@ -1416,6 +1488,10 @@ sift init ~/Downloads
 $EDITOR ~/Downloads/.sift.toml
 sift organize ~/Downloads
 ```
+
+## Organize a library by its own metadata (music, photos, documents...)
+
+Each folder's `.sift.toml` is independent, so `~/Music`, `~/Pictures`, and `~/Documents` can each run a different metadata-based `strategy` (tags, EXIF, document properties) at the same time — see [Passo a passo: uma estratégia diferente por pasta](#passo-a-passo-uma-estratégia-diferente-por-pasta) for the full example.
 
 ## Turn an Inbox into a Smart Inbox
 

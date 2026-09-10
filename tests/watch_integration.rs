@@ -361,6 +361,50 @@ fn daemon_status_reports_not_running_when_lock_is_free() {
     });
 }
 
+#[test]
+fn tray_singleton_lock_prevents_second_tray() {
+    with_isolated_registry(|_root| {
+        let lock_path = registry::tray_lock_path();
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let f1 = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        f1.lock().unwrap();
+
+        let f2 = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let second = f2.try_lock();
+        assert!(
+            matches!(second, Err(std::fs::TryLockError::WouldBlock)),
+            "a second sift-tray must never acquire the singleton lock while the first holds it"
+        );
+        f1.unlock().unwrap();
+    });
+}
+
+#[test]
+fn tray_ensure_running_best_effort_is_a_safe_noop_outside_the_cli_binary() {
+    // The test binary is never literally named `sift`, so this must
+    // short-circuit before touching the lock file at all — it must never
+    // panic, block, or attempt to spawn a real process from a test run.
+    with_isolated_registry(|_root| {
+        sift::watch::tray::ensure_running_best_effort();
+        assert!(
+            !registry::tray_lock_path().exists(),
+            "must not even open the tray lock file when not called from the `sift` binary"
+        );
+    });
+}
+
 // ============================================================
 // Event eligibility / ancestor protection via the engine
 // ============================================================

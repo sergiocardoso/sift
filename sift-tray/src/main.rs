@@ -54,7 +54,40 @@ enum Action {
     Quit,
 }
 
+/// Acquires the same singleton lock `sift watch start` checks before
+/// auto-launching this app (`sift::watch::registry::tray_lock_path()`),
+/// so double-launching (manually, or via two watches starting in quick
+/// succession) never ends up with two tray icons. The returned `File`
+/// must be kept alive for the rest of the process — the OS releases the
+/// lock automatically on exit, so there's no explicit unlock/drop needed.
+fn acquire_singleton_lock_or_exit() -> std::fs::File {
+    use sift::watch::registry;
+    if let Err(e) = std::fs::create_dir_all(registry::watch_dir()) {
+        eprintln!("sift-tray: cannot create watch dir: {e}");
+        std::process::exit(1);
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(registry::tray_lock_path())
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("sift-tray: cannot open lock file: {e}");
+            std::process::exit(1);
+        }
+    };
+    if file.try_lock().is_err() {
+        eprintln!("sift-tray: another instance is already running, exiting.");
+        std::process::exit(0);
+    }
+    file
+}
+
 fn main() {
+    let _singleton_lock = acquire_singleton_lock_or_exit();
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     let proxy = event_loop.create_proxy();

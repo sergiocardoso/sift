@@ -13,6 +13,8 @@
 //!   - `daemon`: the single background process — notify integration,
 //!     singleton lock, registry polling.
 //!   - `platform`: Unix-only detached process spawning.
+//!   - `tray`: best-effort auto-launch of the optional `sift-tray` GUI
+//!     app alongside a watch (never required, never an error if absent).
 
 pub mod daemon;
 pub mod eligibility;
@@ -20,6 +22,7 @@ pub mod engine;
 pub mod platform;
 pub mod registry;
 pub mod stability;
+pub mod tray;
 
 use registry::{WatchEntry, WatchState};
 use std::path::{Path, PathBuf};
@@ -140,6 +143,9 @@ fn cmd_watch_transition(path: String, to: WatchState, verb: &str) -> bool {
                     eprintln!("warning: watch state updated, but the daemon is not confirmed running: {e}");
                     eprintln!("Check with `sift watch daemon status`.");
                 }
+                // Best-effort only: never affects this command's outcome
+                // or output either way (see `tray` module docs).
+                tray::ensure_running_best_effort();
             }
             true
         }

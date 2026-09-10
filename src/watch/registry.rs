@@ -55,6 +55,12 @@ pub fn daemon_stop_path() -> PathBuf {
 pub fn daemon_log_path() -> PathBuf {
     watch_dir().join("daemon.log")
 }
+pub fn tray_lock_path() -> PathBuf {
+    watch_dir().join("tray.lock")
+}
+pub fn tray_log_path() -> PathBuf {
+    watch_dir().join("tray.log")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

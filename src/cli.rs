@@ -1,31 +1,42 @@
+use clap::builder::styling::{AnsiColor, Effects};
+use clap::builder::Styles;
 use clap::{Parser, Subcommand};
 
 const EXAMPLES: &str = "\
 EXAMPLES:
-  sift                       Preview an organize plan for the current directory
-  sift scan .                List what's in a directory (never mutates)
-  sift organize .            Preview an organize plan (dry-run, no changes)
-  sift organize . --apply    Actually move files according to the plan
-  sift organize . --recursive
-                             Organize every eligible subdirectory in place
-  sift clean . --apply       Send high-confidence junk (.tmp/.swp/.swo) to the trash
-  sift doctor .              Report large files, stale archives, sensitive-looking names
-  sift history               List past operations
-  sift undo <operation-id>   Reverse a successful move
-  sift init .                Write a starter .sift.toml with example rules
-  sift watch add ~/Inbox --auto-apply
-                             Register a folder for automatic organization
-  sift watch start ~/Inbox   Start watching (does not touch pre-existing files)
-  sift watch list            Show every registered watch and its state
-  sift folders .             Preview which whole subfolders would move into Documents/Images/...
-  sift folders . --apply     Actually move high-confidence folders (never merges, never overwrites)
-  sift folders . --remove-duplicates --apply
-                             Also send exact-content duplicate files (inside similarly-named
-                             folders) to the Trash
-  sift config check ~/Downloads
-                             Validate the effective .sift.toml policy for a directory
-  sift explain ~/Downloads/movie.mp4
-                             Read-only: show exactly what organize would do to one file, and why
+  Everyday use:
+    sift                       Preview an organize plan for the current directory
+    sift scan .                List what's in a directory (never mutates)
+    sift organize .            Preview an organize plan (dry-run, no changes)
+    sift organize . --apply    Actually move files according to the plan
+    sift organize . --recursive
+                               Organize every eligible subdirectory in place
+    sift clean . --apply       Send high-confidence junk (.tmp/.swp/.swo) to the trash
+    sift doctor .              Report large files, stale archives, sensitive-looking names
+
+  History & undo:
+    sift history                List past operations
+    sift undo <operation-id>    Reverse a successful move
+
+  Custom policy (.sift.toml — see README for metadata-based strategies):
+    sift init .                 Write a starter .sift.toml with example rules
+    sift config check ~/Downloads
+                                 Validate the effective .sift.toml policy for a directory
+    sift explain ~/Downloads/movie.mp4
+                                 Read-only: show exactly what organize would do to one file, and why
+
+  Automatic organization (watch):
+    sift watch add ~/Inbox --auto-apply
+                               Register a folder for automatic organization
+    sift watch start ~/Inbox   Start watching (does not touch pre-existing files)
+    sift watch list            Show every registered watch and its state
+
+  Whole-folder moves:
+    sift folders .             Preview which whole subfolders would move into Documents/Images/...
+    sift folders . --apply     Actually move high-confidence folders (never merges, never overwrites)
+    sift folders . --remove-duplicates --apply
+                               Also send exact-content duplicate files (inside similarly-named
+                               folders) to the Trash
 
 Add --json to scan, organize, clean, doctor, folders, config check, or
 explain for machine-readable output.
@@ -40,6 +51,14 @@ and only ever removes a file that is byte-for-byte identical to one already
 kept — sent to the Trash, never permanently deleted.
 See `sift watch --help` for the full watch command group.";
 
+fn styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Green.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+}
+
 /// Sift: a local-first, safe CLI to organize and clean up a directory.
 ///
 /// Every command is a dry-run by default and only prints a plan; nothing
@@ -49,7 +68,7 @@ See `sift watch --help` for the full watch command group.";
 /// directories (containing .git, Cargo.toml, package.json, pyproject.toml,
 /// or pubspec.yaml) are never touched.
 #[derive(Parser)]
-#[command(name = "sift", version, after_help = EXAMPLES)]
+#[command(name = "sift", version, after_help = EXAMPLES, styles = styles())]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -230,7 +249,9 @@ pub enum WatchCommands {
         json: bool,
     },
     /// Start monitoring a registered (stopped) watch; does not back-fill
-    /// files that already existed before this
+    /// files that already existed before this. Also tries (best-effort,
+    /// silently) to launch the optional sift-tray app if it's installed
+    /// and not already running — see the README's sift-tray section
     Start {
         /// Registered watch to start
         path: String,
