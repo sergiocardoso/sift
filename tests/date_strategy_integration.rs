@@ -367,7 +367,7 @@ fn broken_symlink_occupying_destination_blocks() {
 }
 
 #[test]
-fn destination_file_collision_blocks() {
+fn destination_file_collision_with_different_content_is_renamed() {
     let d = tempdir().unwrap();
     let t = d.path();
     fs::create_dir_all(t.join("2026/09")).unwrap();
@@ -384,16 +384,47 @@ fn destination_file_collision_blocks() {
         .iter()
         .find(|a| a.src.ends_with("invoice.pdf") && a.src.parent() == Some(t))
         .unwrap();
-    assert_eq!(a.op, Op::Skip);
-    assert_eq!(a.reason.as_deref(), Some("collision"));
+    assert_eq!(a.op, Op::Move);
+    assert_eq!(a.dst.as_ref().unwrap(), &t.join("2026/09/invoice (1).pdf"));
     assert_eq!(
         fs::read_to_string(t.join("2026/09/invoice.pdf")).unwrap(),
-        "existing"
+        "existing",
+        "the pre-existing file at the colliding name must never be touched"
     );
 }
 
 #[test]
-fn date_apply_never_overwrites() {
+fn blocked_date_collision_produces_no_move_action() {
+    // A destination occupied by something automatic resolution must never
+    // touch on its own (here: a broken symlink) still refuses at plan
+    // time — no Move action is ever produced, so nothing could later be
+    // wrongly marked successful.
+    let d = tempdir().unwrap();
+    let t = d.path();
+    fs::create_dir_all(t.join("2026/09")).unwrap();
+    std::os::unix::fs::symlink("/nonexistent", t.join("2026/09/invoice.pdf")).unwrap();
+    touch_dated(&t.join("invoice.pdf"), 2026, 9, 9);
+    let policy = date_policy("{year}/{month}");
+    let plan = plan_with_strategy(
+        t.to_str().unwrap(),
+        &policy,
+        &sift::classifier::CategoryDB::default(),
+    );
+    assert!(!plan
+        .actions
+        .iter()
+        .any(|a| a.op == Op::Move && a.src.parent() == Some(t)));
+    let a = plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("invoice.pdf") && a.src.parent() == Some(t))
+        .unwrap();
+    assert_eq!(a.op, Op::Skip);
+    assert_eq!(a.reason.as_deref(), Some("collision"));
+}
+
+#[test]
+fn date_apply_renames_on_different_content_never_overwrites() {
     let d = tempdir().unwrap();
     let t = d.path();
     fs::create_dir_all(t.join("2026/09")).unwrap();
@@ -410,11 +441,17 @@ fn date_apply_never_overwrites() {
     sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
     assert_eq!(
         fs::read_to_string(t.join("2026/09/invoice.pdf")).unwrap(),
-        "existing"
+        "existing",
+        "the pre-existing file must never be overwritten"
+    );
+    assert_eq!(
+        fs::read_to_string(t.join("2026/09/invoice (1).pdf")).unwrap(),
+        "x",
+        "the new file must land at a disambiguated name"
     );
     assert!(
-        t.join("invoice.pdf").exists(),
-        "source stays put on refused collision"
+        !t.join("invoice.pdf").exists(),
+        "source is gone once successfully organized under the disambiguated name"
     );
     sift::history::clear_test_history_dir();
 }
@@ -1299,7 +1336,10 @@ fn undo_safely_restores_date_organized_file() {
 }
 
 #[test]
-fn failed_date_action_not_marked_successful() {
+fn renamed_date_collision_move_is_undoable() {
+    // A rename-on-collision Move is a real, successful move — it must be
+    // just as undoable as any other Move, not quietly excluded because it
+    // came from automatic collision handling.
     let d = tempdir().unwrap();
     let t = d.path();
     touch_dated(&t.join("invoice.pdf"), 2026, 9, 9);
@@ -1311,11 +1351,10 @@ fn failed_date_action_not_marked_successful() {
         &policy,
         &sift::classifier::CategoryDB::default(),
     );
-    // The plan should already have refused this at plan time (collision);
-    // confirm no Move action was even produced, so nothing could ever be
-    // wrongly marked successful.
-    assert!(!plan
+    let a = plan
         .actions
         .iter()
-        .any(|a| a.op == Op::Move && a.src.parent() == Some(t)));
+        .find(|a| a.op == Op::Move && a.src.parent() == Some(t))
+        .unwrap();
+    assert!(a.undoable);
 }

@@ -496,6 +496,163 @@ pub(crate) fn classify_for_documents(
     }
 }
 
+/// Reason prefix for a duplicate-collision `Trash`: a file already exists
+/// at the computed destination with byte-identical content, so the source
+/// is redundant rather than genuinely new. `render.rs` matches on this
+/// prefix to always surface these in the terminal, never buried in an
+/// aggregate count — see `is_duplicate_collision_reason`.
+pub(crate) const IDENTICAL_DUPLICATE_REASON_PREFIX: &str =
+    "identical duplicate already organized at ";
+/// Reason suffix for a duplicate-collision `Move`: a *different* file
+/// already occupies the computed destination name, so this entry was
+/// organized under a disambiguated name instead of being silently skipped
+/// or overwriting anything. Same "always surface it" treatment as
+/// `IDENTICAL_DUPLICATE_REASON_PREFIX` — see `render.rs`.
+pub(crate) const RENAMED_COLLISION_REASON_SUFFIX: &str =
+    " (renamed: a different file already exists at that name)";
+
+/// What a computed destination *file* path (directory levels already
+/// confirmed real) turned out to hold, once collision handling actually
+/// looks at what's there instead of just refusing on sight. The single
+/// point every strategy's per-entry planning shares this decision through
+/// (`finalize_move_action`), so `type`/`date`/`audio`/`video`/`photos`/
+/// `documents` can never quietly diverge on how a same-name collision is
+/// resolved.
+enum DestinationFileStatus {
+    /// Nothing exists there — the ordinary case, free to move.
+    Clear,
+    /// Something exists there already, and it's byte-identical to the
+    /// source (`fs::files_have_identical_content`) — the source is a
+    /// redundant duplicate of what's already organized.
+    IdenticalDuplicate,
+    /// Something exists there already, with *different* content — the
+    /// source still gets organized, just under this disambiguated name
+    /// instead (`"name (1).ext"`, ...) so nothing is ever silently
+    /// overwritten or dropped.
+    Renamed(PathBuf),
+    /// Occupied by something automatic resolution must never touch on its
+    /// own (a directory, a symlink, or content that couldn't be safely
+    /// compared) — the original, unconditional "collision" skip.
+    Blocked,
+}
+
+/// The next available `"name (1).ext"`, `"name (2).ext"`, ... path next to
+/// `dest` that doesn't yet exist. No-follow (`symlink_metadata`), so a
+/// broken symlink still counts as occupied, the same as every other
+/// occupancy check in this module. `None` only if even a few thousand
+/// attempts are all taken — pathological, and the caller falls back to the
+/// ordinary "collision" skip rather than looping forever.
+fn disambiguated_path(dest: &Path) -> Option<PathBuf> {
+    let parent = dest.parent()?;
+    let stem = dest.file_stem()?.to_string_lossy().into_owned();
+    let ext = dest.extension().map(|e| e.to_string_lossy().into_owned());
+    for n in 1..=9999u32 {
+        let candidate_name = match &ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = parent.join(candidate_name);
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Looks at what's actually occupying `dest` (no-follow metadata, so a
+/// symlink or broken symlink is never treated as comparable content) and
+/// decides which `DestinationFileStatus` applies.
+fn resolve_destination_file(src: &Path, dest: &Path) -> DestinationFileStatus {
+    match std::fs::symlink_metadata(dest) {
+        Err(_) => DestinationFileStatus::Clear,
+        Ok(md) if !md.is_file() => DestinationFileStatus::Blocked,
+        Ok(_) => match crate::fs::files_have_identical_content(src, dest) {
+            Ok(true) => DestinationFileStatus::IdenticalDuplicate,
+            Ok(false) => match disambiguated_path(dest) {
+                Some(alt) => DestinationFileStatus::Renamed(alt),
+                None => DestinationFileStatus::Blocked,
+            },
+            Err(_) => DestinationFileStatus::Blocked,
+        },
+    }
+}
+
+/// Turns a computed destination directory + `reason` into the final
+/// `Action`, once every ancestor directory level between `target` and
+/// `dest_dir` is already confirmed real or queued via `to_create` — the
+/// single point `resolve_organize_action`/`resolve_date_action`/
+/// `resolve_metadata_action` all funnel through for the file-level
+/// collision decision (`resolve_destination_file`), so duplicate
+/// detection and disambiguated renaming live in exactly one place instead
+/// of three near-identical copies.
+fn finalize_move_action(
+    entry: &Entry,
+    dest_dir: &Path,
+    reason: String,
+    to_create: Vec<PathBuf>,
+    needed_dirs: &mut BTreeSet<PathBuf>,
+) -> Action {
+    let skip = |reason: &str| Action {
+        src: entry.path.clone(),
+        dst: None,
+        op: Op::Skip,
+        reason: Some(reason.to_string()),
+        undoable: false,
+    };
+    let skip_with_intended_dst = |dest: PathBuf, reason: &str| Action {
+        src: entry.path.clone(),
+        dst: Some(dest),
+        op: Op::Skip,
+        reason: Some(reason.to_string()),
+        undoable: false,
+    };
+    let Some(filename) = entry.path.file_name() else {
+        return skip("entry has no file name");
+    };
+    let dest = dest_dir.join(filename);
+    match resolve_destination_file(&entry.path, &dest) {
+        DestinationFileStatus::Blocked => skip_with_intended_dst(dest, "collision"),
+        DestinationFileStatus::IdenticalDuplicate => Action {
+            src: entry.path.clone(),
+            // The existing duplicate's path travels on `dst` so the
+            // executor can re-verify it's *still* identical right before
+            // trashing (TOCTOU: the world may have changed since this was
+            // planned) — see `executor::execute_plan`'s `Op::Trash` arm.
+            dst: Some(dest.clone()),
+            op: Op::Trash,
+            reason: Some(format!(
+                "{IDENTICAL_DUPLICATE_REASON_PREFIX}{}",
+                dest.display()
+            )),
+            undoable: false,
+        },
+        DestinationFileStatus::Clear => {
+            for dir in to_create {
+                needed_dirs.insert(dir);
+            }
+            Action {
+                src: entry.path.clone(),
+                dst: Some(dest),
+                op: Op::Move,
+                reason: Some(reason),
+                undoable: true,
+            }
+        }
+        DestinationFileStatus::Renamed(alt) => {
+            for dir in to_create {
+                needed_dirs.insert(dir);
+            }
+            Action {
+                src: entry.path.clone(),
+                dst: Some(alt),
+                op: Op::Move,
+                reason: Some(format!("{reason}{RENAMED_COLLISION_REASON_SUFFIX}")),
+                undoable: true,
+            }
+        }
+    }
+}
+
 /// Resolves one entry's final action, checking real filesystem collisions
 /// and recording any directory that still needs `Op::CreateDir`.
 fn resolve_organize_action(
@@ -506,13 +663,6 @@ fn resolve_organize_action(
     needed_dirs: &mut BTreeSet<PathBuf>,
     unknown_policy: UnknownPolicy,
 ) -> Action {
-    let skip = |reason: &str| Action {
-        src: entry.path.clone(),
-        dst: None,
-        op: Op::Skip,
-        reason: Some(reason.to_string()),
-        undoable: false,
-    };
     // Collision skips keep the intended destination visible in the plan so
     // the user can see what blocked the move, even though it never happens.
     let skip_with_intended_dst = |dest: PathBuf, reason: &str| Action {
@@ -543,25 +693,15 @@ fn resolve_organize_action(
             cause: _,
         } => match dir_status(&dest_dir) {
             DirStatus::Blocked => skip_with_intended_dst(dest_dir, "collision"),
-            status => {
-                let Some(filename) = entry.path.file_name() else {
-                    return skip("entry has no file name");
-                };
-                let dest = dest_dir.join(filename);
-                if std::fs::symlink_metadata(&dest).is_ok() {
-                    skip_with_intended_dst(dest, "collision")
-                } else {
-                    if matches!(status, DirStatus::Missing) {
-                        needed_dirs.insert(dest_dir.clone());
-                    }
-                    Action {
-                        src: entry.path.clone(),
-                        dst: Some(dest),
-                        op: Op::Move,
-                        reason: Some(reason),
-                        undoable: true,
-                    }
-                }
+            DirStatus::Missing => finalize_move_action(
+                entry,
+                &dest_dir,
+                reason,
+                vec![dest_dir.clone()],
+                needed_dirs,
+            ),
+            DirStatus::Exists => {
+                finalize_move_action(entry, &dest_dir, reason, vec![], needed_dirs)
             }
         },
     }
@@ -641,23 +781,7 @@ fn resolve_date_action(
                     DirStatus::Exists => {}
                 }
             }
-            let Some(filename) = entry.path.file_name() else {
-                return skip("entry has no file name");
-            };
-            let dest = dest_dir.join(filename);
-            if std::fs::symlink_metadata(&dest).is_ok() {
-                return skip_with_intended_dst(dest, "collision");
-            }
-            for dir in to_create {
-                needed_dirs.insert(dir);
-            }
-            Action {
-                src: entry.path.clone(),
-                dst: Some(dest),
-                op: Op::Move,
-                reason: Some(reason),
-                undoable: true,
-            }
+            finalize_move_action(entry, &dest_dir, reason, to_create, needed_dirs)
         }
     }
 }
@@ -782,23 +906,7 @@ fn resolve_metadata_action(
                     DirStatus::Exists => {}
                 }
             }
-            let Some(filename) = entry.path.file_name() else {
-                return skip("entry has no file name");
-            };
-            let dest = dest_dir.join(filename);
-            if std::fs::symlink_metadata(&dest).is_ok() {
-                return skip_with_intended_dst(dest, "collision");
-            }
-            for dir in to_create {
-                needed_dirs.insert(dir);
-            }
-            Action {
-                src: entry.path.clone(),
-                dst: Some(dest),
-                op: Op::Move,
-                reason: Some(reason),
-                undoable: true,
-            }
+            finalize_move_action(entry, &dest_dir, reason, to_create, needed_dirs)
         }
     }
 }
@@ -1723,10 +1831,11 @@ pub fn cmd_organize(path: String, apply: bool, json: bool, verbose: bool, recurs
     } else {
         "organize"
     };
+    let actions_for_render = plan.actions.clone();
     let (hist_id, outcomes) = crate::executor::execute_plan(plan, &path, kind, None);
     let ok = !outcomes.iter().any(|o| o.result.is_err());
     if !json {
-        crate::render::organize_apply_result(&path, &outcomes, &hist_id);
+        crate::render::organize_apply_result(&path, &actions_for_render, &outcomes, &hist_id);
     }
     ok
 }
@@ -1752,10 +1861,11 @@ pub fn cmd_clean(path: String, apply: bool, json: bool, verbose: bool) -> bool {
     if !apply {
         return true;
     }
+    let actions_for_render = plan.actions.clone();
     let (hist_id, outcomes) = crate::executor::execute_plan(plan, &path, "clean", None);
     let ok = !outcomes.iter().any(|o| o.result.is_err());
     if !json {
-        crate::render::clean_apply_result(&path, &outcomes, &hist_id);
+        crate::render::clean_apply_result(&path, &actions_for_render, &outcomes, &hist_id);
     }
     ok
 }

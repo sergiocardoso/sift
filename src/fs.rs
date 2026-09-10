@@ -148,3 +148,39 @@ pub fn send_to_trash(src: &PathBuf) -> Result<(), FSActionError> {
     }
     trash::delete(src).map_err(|e| FSActionError::Other(e.to_string()))
 }
+
+/// Whether `a` and `b` are byte-for-byte identical: size first (cheap,
+/// rules out almost every non-match immediately), then content compared in
+/// fixed-size chunks so a large file is never loaded into memory whole.
+/// Used by organize's duplicate-collision handling
+/// (`planner::resolve_destination_file`) to tell "this is the same file,
+/// already organized" from "this just happens to share a name" before
+/// deciding to trash or rename. Any I/O error partway through (a file
+/// disappearing or becoming unreadable mid-comparison) is surfaced rather
+/// than guessed at either way — callers treat `Err` as "cannot safely
+/// tell", never as a silent "yes" or "no".
+pub fn files_have_identical_content(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let meta_a = fs::metadata(a)?;
+    let meta_b = fs::metadata(b)?;
+    if meta_a.len() != meta_b.len() {
+        return Ok(false);
+    }
+    let mut fa = fs::File::open(a)?;
+    let mut fb = fs::File::open(b)?;
+    let mut buf_a = [0u8; 65536];
+    let mut buf_b = [0u8; 65536];
+    loop {
+        let na = fa.read(&mut buf_a)?;
+        let nb = fb.read(&mut buf_b)?;
+        if na != nb {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+        if buf_a[..na] != buf_b[..nb] {
+            return Ok(false);
+        }
+    }
+}

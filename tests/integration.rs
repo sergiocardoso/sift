@@ -191,7 +191,10 @@ fn test_apply_move_and_undo() {
 }
 
 #[test]
-fn test_collision_no_overwrite() {
+fn test_collision_identical_content_is_trashed_not_overwritten() {
+    // Both files are empty, so byte-for-byte identical: the source is a
+    // redundant duplicate of what's already organized, trashed rather
+    // than moved — never silently overwriting the existing copy.
     let d = tempdir().unwrap();
     let t = d.path();
     File::create(t.join("foo.pdf")).unwrap();
@@ -213,7 +216,39 @@ fn test_collision_no_overwrite() {
                 .unwrap_or(false)
         })
         .unwrap();
-    assert_eq!(act.op, Op::Skip);
+    assert_eq!(act.op, Op::Trash);
+    assert!(act
+        .reason
+        .as_deref()
+        .unwrap_or("")
+        .starts_with("identical duplicate already organized at"));
+}
+
+#[test]
+fn test_collision_different_content_is_renamed_not_overwritten() {
+    let d = tempdir().unwrap();
+    let t = d.path();
+    std::fs::write(t.join("foo.pdf"), b"new content").unwrap();
+    std::fs::create_dir_all(t.join("Documents")).unwrap();
+    std::fs::write(t.join("Documents/foo.pdf"), b"different content").unwrap();
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
+    let act = plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("foo.pdf") && !a.src.to_string_lossy().contains("Documents"))
+        .unwrap();
+    assert_eq!(act.op, Op::Move);
+    assert_eq!(act.dst.as_ref().unwrap(), &t.join("Documents/foo (1).pdf"));
+    assert!(act
+        .reason
+        .as_deref()
+        .unwrap_or("")
+        .ends_with("(renamed: a different file already exists at that name)"));
 }
 
 #[test]
@@ -1239,6 +1274,8 @@ fn test_recursive_discovery_skips_known_build_and_vcs_dir_names() {
 
 #[test]
 fn test_recursive_organize_collision_in_nested_dir() {
+    // Both files are empty (byte-identical), so the nested duplicate is
+    // trashed, not overwritten or silently skipped.
     use sift::planner::plan_organize_recursive;
     let d = tempdir().unwrap();
     let t = d.path();
@@ -1258,8 +1295,11 @@ fn test_recursive_organize_collision_in_nested_dir() {
         .iter()
         .find(|a| a.src == t.join("nested/report.pdf"))
         .unwrap();
-    assert_eq!(action.op, Op::Skip);
-    assert_eq!(action.reason.as_deref(), Some("collision"));
+    assert_eq!(action.op, Op::Trash);
+    assert_eq!(
+        action.dst.as_ref().unwrap(),
+        &t.join("nested/Documents/report.pdf")
+    );
 }
 
 #[test]
@@ -1334,6 +1374,50 @@ fn test_recursive_executor_toctou_collision_in_nested_dir() {
     assert!(found_failure);
     let _ = outcomes;
     clear_test_history_dir();
+}
+
+#[test]
+fn test_duplicate_trash_toctou_refused_when_no_longer_identical() {
+    // The duplicate-collision counterpart to
+    // `test_recursive_executor_toctou_collision_in_nested_dir`: a `Trash`
+    // planned because two files were identical must be independently
+    // re-verified right before it actually happens — if the "duplicate" at
+    // `dst` changed in between (or vanished), it's no longer safe to
+    // assume the source is redundant, so execution must refuse rather than
+    // trash it anyway.
+    use sift::executor::execute_plan;
+    let d = tempdir().unwrap();
+    let t = d.path();
+    File::create(t.join("foo.pdf")).unwrap();
+    std::fs::create_dir_all(t.join("Documents")).unwrap();
+    File::create(t.join("Documents/foo.pdf")).unwrap();
+
+    let plan = plan_organize(
+        t.to_str().unwrap(),
+        &[],
+        &CategoryDB::default(),
+        UnknownPolicy::Other,
+    );
+    let action = plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("foo.pdf") && !a.src.to_string_lossy().contains("Documents"))
+        .unwrap();
+    assert_eq!(action.op, Op::Trash, "both files are empty: identical");
+
+    // Race: the "duplicate" changes after planning but before execution.
+    std::fs::write(t.join("Documents/foo.pdf"), b"no longer identical").unwrap();
+
+    let (_id, outcomes) = execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    let trash_outcome = outcomes.iter().find(|o| o.op == Op::Trash).unwrap();
+    assert!(
+        trash_outcome.result.is_err(),
+        "must refuse once the duplicate is no longer identical"
+    );
+    assert!(
+        t.join("foo.pdf").exists(),
+        "a refused trash must leave the source untouched"
+    );
 }
 
 #[test]
@@ -1733,7 +1817,10 @@ fn test_config_move_overrides_builtin_code_category() {
 }
 
 #[test]
-fn test_collision_in_other_directory_is_skipped() {
+fn test_collision_in_other_directory_is_trashed_when_identical() {
+    // Both files are empty (byte-identical): the loose one is a redundant
+    // duplicate of what's already in `Other/`, trashed rather than
+    // silently skipped in place.
     let d = tempdir().unwrap();
     let t = d.path();
     std::fs::create_dir_all(t.join("Other")).unwrap();
@@ -1747,8 +1834,8 @@ fn test_collision_in_other_directory_is_skipped() {
         UnknownPolicy::Other,
     );
     let a = move_dest(&plan, "mystery.xyz");
-    assert_eq!(a.op, Op::Skip);
-    assert_eq!(a.reason.as_deref(), Some("collision"));
+    assert_eq!(a.op, Op::Trash);
+    assert_eq!(a.dst.as_ref().unwrap(), &t.join("Other/mystery.xyz"));
 }
 
 #[test]

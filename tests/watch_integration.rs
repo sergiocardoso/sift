@@ -658,7 +658,7 @@ fn watched_explicit_createdir_is_recorded_in_history() {
 }
 
 #[test]
-fn watched_collision_never_overwrites() {
+fn watched_collision_with_different_content_is_renamed_never_overwrites() {
     let d = tempdir().unwrap();
     let root = d.path();
     fs::create_dir_all(root.join("Images")).unwrap();
@@ -672,11 +672,45 @@ fn watched_collision_never_overwrites() {
             &sift::classifier::CategoryDB::default(),
             &f,
         );
-        assert!(!outcome.organized);
-        assert_eq!(outcome.skip_reason.as_deref(), Some("collision"));
+        assert!(outcome.organized);
+        assert!(!f.exists());
         assert_eq!(
             fs::read_to_string(root.join("Images/photo.jpg")).unwrap(),
-            "existing"
+            "existing",
+            "the pre-existing file at the colliding name must never be touched"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Images/photo (1).jpg")).unwrap(),
+            "new",
+            "the new file must land at a disambiguated name instead of being dropped"
+        );
+    });
+}
+
+#[test]
+fn watched_collision_with_identical_content_trashes_the_duplicate() {
+    let d = tempdir().unwrap();
+    let root = d.path();
+    fs::create_dir_all(root.join("Images")).unwrap();
+    fs::write(root.join("Images/photo.jpg"), b"same bytes").unwrap();
+    let f = root.join("photo.jpg");
+    fs::write(&f, b"same bytes").unwrap();
+    with_isolated_history(root, || {
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
+        assert!(!outcome.organized, "a trash is not a move");
+        assert!(
+            !f.exists(),
+            "the redundant duplicate must be gone once trashed"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("Images/photo.jpg")).unwrap(),
+            "same bytes",
+            "the already-organized copy must be untouched"
         );
     });
 }
@@ -705,26 +739,52 @@ fn watched_broken_symlink_collision_never_overwrites() {
 
 #[test]
 fn watched_toctou_collision_is_refused_and_recorded() {
+    // A genuine plan-then-race: `process_candidate` bundles planning and
+    // execution together with no seam to inject a race between them (and
+    // by now, a same-name collision found *at planning time* is resolved
+    // proactively — trashed or renamed — never deferred to execution).
+    // So this drives the same two steps `process_candidate` does, but
+    // separately, planning first while the destination is still clear,
+    // *then* introducing the race, exactly like
+    // `test_recursive_executor_toctou_collision_in_nested_dir` does for
+    // recursive organize.
+    use sift::planner::plan_entry_with_strategy;
     let d = tempdir().unwrap();
     let root = d.path();
     let f = root.join("race.jpg");
     fs::write(&f, b"x").unwrap();
-    // Simulate the destination appearing between "decision" and execution
-    // by pre-creating it before calling process_candidate at all — the
-    // planner's own collision check would normally catch this, but the
-    // executor's independent revalidation is what really guarantees safety
-    // regardless of when the race happens (see fs::safe_rename).
+    let entry = sift::scanner::revalidate_candidate(root, &f).unwrap();
+    let entry_plan = plan_entry_with_strategy(
+        &entry,
+        root,
+        &EffectivePolicy::default(),
+        &sift::classifier::CategoryDB::default(),
+    );
+    assert_eq!(
+        entry_plan.action.op,
+        Op::Move,
+        "nothing occupies Images/race.jpg yet"
+    );
+
+    // Race: the destination appears after planning but before execution.
     fs::create_dir_all(root.join("Images")).unwrap();
     fs::write(root.join("Images/race.jpg"), b"existing").unwrap();
+
     with_isolated_history(root, || {
-        let outcome = process_candidate(
-            root,
-            &EffectivePolicy::default(),
-            &sift::classifier::CategoryDB::default(),
-            &f,
+        let mut actions = entry_plan.create_dirs;
+        actions.push(entry_plan.action);
+        let (_id, outcomes) = sift::executor::execute_plan(
+            sift::domain::Plan { actions },
+            root.to_str().unwrap(),
+            "organize",
+            Some(root),
         );
-        assert!(!outcome.organized);
-        assert!(f.exists());
+        let move_outcome = outcomes.iter().find(|o| o.op == Op::Move).unwrap();
+        assert!(
+            move_outcome.result.is_err(),
+            "the race must be caught at execution time"
+        );
+        assert!(f.exists(), "a failed move must leave the source untouched");
         assert_eq!(
             fs::read_to_string(root.join("Images/race.jpg")).unwrap(),
             "existing"
@@ -851,16 +911,18 @@ fn watch_move_can_be_undone_normally() {
 }
 
 #[test]
-fn watch_failed_action_is_recorded_and_not_undoable() {
+fn watch_blocked_collision_is_not_recorded_and_not_undoable() {
+    use std::os::unix::fs::symlink;
     let d = tempdir().unwrap();
     let root = d.path();
     fs::create_dir_all(root.join("Images")).unwrap();
-    fs::write(root.join("Images/photo.jpg"), b"existing").unwrap();
+    symlink("/nonexistent", root.join("Images/photo.jpg")).unwrap();
     let f = root.join("photo.jpg");
     fs::write(&f, b"new").unwrap();
     with_isolated_history(root, || {
-        // This is a plan-time collision skip, so no history is written at
-        // all (nothing was executed) — confirm that directly.
+        // A symlink at the destination is still genuinely blocked (never
+        // compared, never disambiguated) — this is a plan-time collision
+        // skip, so no history is written at all (nothing was executed).
         let outcome = process_candidate(
             root,
             &EffectivePolicy::default(),

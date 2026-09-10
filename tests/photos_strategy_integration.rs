@@ -187,7 +187,7 @@ fn nested_createdir_actions_for_three_level_template() {
 }
 
 #[test]
-fn destination_collision_blocks() {
+fn destination_collision_with_different_content_is_renamed() {
     let d = tempdir().unwrap();
     let t = d.path();
     fs::create_dir_all(t.join("Apple iPhone 13/2022")).unwrap();
@@ -204,11 +204,15 @@ fn destination_collision_blocks() {
         .iter()
         .find(|a| a.src.ends_with("photo.jpg") && a.src.parent() == Some(t))
         .unwrap();
-    assert_eq!(a.op, Op::Skip);
-    assert_eq!(a.reason.as_deref(), Some("collision"));
+    assert_eq!(a.op, Op::Move);
+    assert_eq!(
+        a.dst.as_ref().unwrap(),
+        &t.join("Apple iPhone 13/2022/photo (1).jpg")
+    );
     assert_eq!(
         fs::read_to_string(t.join("Apple iPhone 13/2022/photo.jpg")).unwrap(),
-        "existing"
+        "existing",
+        "the pre-existing file at the colliding name must never be touched"
     );
 }
 

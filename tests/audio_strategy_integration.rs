@@ -207,7 +207,7 @@ fn nested_createdir_actions_for_two_level_template() {
 }
 
 #[test]
-fn destination_collision_blocks() {
+fn destination_collision_with_different_content_is_renamed() {
     let d = tempdir().unwrap();
     let t = d.path();
     fs::create_dir_all(t.join("Test Artist/Test Album")).unwrap();
@@ -224,11 +224,20 @@ fn destination_collision_blocks() {
         .iter()
         .find(|a| a.src.ends_with("song.mp3") && a.src.parent() == Some(t))
         .unwrap();
-    assert_eq!(a.op, Op::Skip);
-    assert_eq!(a.reason.as_deref(), Some("collision"));
+    assert_eq!(a.op, Op::Move);
+    assert_eq!(
+        a.dst.as_ref().unwrap(),
+        &t.join("Test Artist/Test Album/song (1).mp3")
+    );
+    assert!(a
+        .reason
+        .as_deref()
+        .unwrap_or("")
+        .ends_with("(renamed: a different file already exists at that name)"));
     assert_eq!(
         fs::read_to_string(t.join("Test Artist/Test Album/song.mp3")).unwrap(),
-        "existing"
+        "existing",
+        "the pre-existing file at the colliding name must never be touched"
     );
 }
 

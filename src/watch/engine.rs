@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn collision_is_skipped_never_overwritten() {
+    fn collision_with_different_content_is_renamed_never_overwritten() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         fs::create_dir_all(root.join("Images")).unwrap();
@@ -255,13 +255,53 @@ mod tests {
 
         sift_history_isolated(root, || {
             let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
-            assert!(!outcome.organized);
-            assert_eq!(outcome.skip_reason.as_deref(), Some("collision"));
-            assert!(file.exists());
+            assert!(outcome.organized);
+            assert!(!file.exists());
             assert_eq!(
                 fs::read_to_string(root.join("Images/photo.jpg")).unwrap(),
                 "existing"
             );
+            assert_eq!(
+                fs::read_to_string(root.join("Images/photo (1).jpg")).unwrap(),
+                "new"
+            );
+        });
+    }
+
+    #[test]
+    fn collision_with_identical_content_trashes_the_duplicate() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        fs::create_dir_all(root.join("Images")).unwrap();
+        fs::write(root.join("Images/photo.jpg"), b"same").unwrap();
+        let file = root.join("photo.jpg");
+        fs::write(&file, b"same").unwrap();
+
+        sift_history_isolated(root, || {
+            let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
+            assert!(!outcome.organized);
+            assert!(!file.exists());
+            assert_eq!(
+                fs::read_to_string(root.join("Images/photo.jpg")).unwrap(),
+                "same"
+            );
+        });
+    }
+
+    #[test]
+    fn blocked_collision_via_symlink_is_still_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        fs::create_dir_all(root.join("Images")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", root.join("Images/photo.jpg")).unwrap();
+        let file = root.join("photo.jpg");
+        fs::write(&file, b"new").unwrap();
+
+        sift_history_isolated(root, || {
+            let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
+            assert!(!outcome.organized);
+            assert_eq!(outcome.skip_reason.as_deref(), Some("collision"));
+            assert!(file.exists());
         });
     }
 

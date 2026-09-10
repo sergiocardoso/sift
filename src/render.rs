@@ -126,8 +126,56 @@ fn render_trash_section(title: &str, trashes: &[&Action], target: &Path) {
     }
     println!();
     println!("{title}");
+    let width = trashes
+        .iter()
+        .map(|a| display_rel(&a.src, target).len())
+        .max()
+        .unwrap_or(0);
     for a in trashes {
+        let reason = a.reason.as_deref().unwrap_or("");
+        println!("  {:<width$}  {reason}", display_rel(&a.src, target));
+    }
+}
+
+/// Whether `reason` names one of the automatic duplicate-collision
+/// resolutions (`planner::IDENTICAL_DUPLICATE_REASON_PREFIX`/
+/// `RENAMED_COLLISION_REASON_SUFFIX`) — the one thing this renderer always
+/// surfaces on its own, in a dedicated section, regardless of `--verbose`
+/// or the skip-list threshold. Silently trashing or renaming something
+/// because it collided with an existing same-name file is exactly the
+/// kind of automatic decision a user must never have to go looking for in
+/// a terminal.
+fn is_duplicate_collision_reason(reason: &str) -> bool {
+    reason.starts_with(crate::planner::IDENTICAL_DUPLICATE_REASON_PREFIX)
+        || reason.ends_with(crate::planner::RENAMED_COLLISION_REASON_SUFFIX)
+}
+
+/// Always-shown warning block for every action `is_duplicate_collision_reason`
+/// recognizes, called from both dry-run renderers (`&[Action]`, before
+/// anything happens) — the apply-result renderer has its own
+/// `render_apply_duplicate_warnings`, since by then execution may have
+/// refused one of these on re-check.
+fn render_duplicate_warnings(actions: &[Action], target: &Path) {
+    let warnings: Vec<&Action> = actions
+        .iter()
+        .filter(|a| {
+            a.reason
+                .as_deref()
+                .is_some_and(is_duplicate_collision_reason)
+        })
+        .collect();
+    if warnings.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{} Duplicate name{} handled automatically",
+        colorize("⚠", "33", use_color()),
+        plural(warnings.len())
+    );
+    for a in &warnings {
         println!("  {}", display_rel(&a.src, target));
+        println!("    {}", a.reason.as_deref().unwrap_or(""));
     }
 }
 
@@ -229,6 +277,7 @@ pub fn organize_dry_run(path: &str, actions: &[Action], is_project_root: bool, v
     render_moves_section(&moves, target);
     render_trash_section("Trash", &trashes, target);
     render_skip_section(&skips, target, verbose);
+    render_duplicate_warnings(actions, target);
 
     println!();
     if moves.is_empty() && trashes.is_empty() {
@@ -396,6 +445,7 @@ pub fn organize_dry_run_recursive(
     render_trash_section("Trash", &trashes, target);
     render_skip_section(&file_skips, target, verbose);
     render_protected_section(&dir_skips, target);
+    render_duplicate_warnings(actions, target);
 
     println!();
     if moves.is_empty() && trashes.is_empty() {
@@ -417,9 +467,48 @@ fn count_ok(outcomes: &[ActionResult], op: Op) -> usize {
         .count()
 }
 
+/// The apply-result counterpart to `render_duplicate_warnings`: same
+/// always-shown treatment, but reflecting what execution actually did —
+/// `dst` on a matching `Action` carries the existing duplicate it was
+/// re-verified against right before trashing (see
+/// `executor::execute_plan`'s `Op::Trash` arm), so a collision resolved at
+/// plan time can still show up here as refused if the world changed
+/// underneath it in between.
+fn render_apply_duplicate_warnings(actions: &[Action], outcomes: &[ActionResult]) {
+    let warnings: Vec<(&Action, &ActionResult)> = actions
+        .iter()
+        .zip(outcomes.iter())
+        .filter(|(a, _)| {
+            a.reason
+                .as_deref()
+                .is_some_and(is_duplicate_collision_reason)
+        })
+        .collect();
+    if warnings.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{} Duplicate name{} handled automatically",
+        colorize("⚠", "33", use_color()),
+        plural(warnings.len())
+    );
+    for (a, o) in &warnings {
+        println!("  {}", a.src.display());
+        match &o.result {
+            Ok(()) => println!("    {}", a.reason.as_deref().unwrap_or("")),
+            Err(e) => println!("    refused — {e}"),
+        }
+    }
+}
+
 /// Reports what execution actually did (never assumes the plan succeeded),
-/// shared by `organize --apply` and `clean --apply`.
-fn render_apply_outcome_summary(outcomes: &[ActionResult], hist_id: &str) {
+/// shared by `organize --apply` and `clean --apply`. `actions` is the
+/// pre-execution plan `outcomes` came from (same order, one-to-one) —
+/// needed here purely to recover each action's `reason` for
+/// `render_apply_duplicate_warnings`, since `ActionResult` itself doesn't
+/// carry one.
+fn render_apply_outcome_summary(actions: &[Action], outcomes: &[ActionResult], hist_id: &str) {
     let color = use_color();
     let has_moves = outcomes.iter().any(|o| o.op == Op::Move);
     let has_creates = outcomes.iter().any(|o| o.op == Op::CreateDir);
@@ -469,6 +558,8 @@ fn render_apply_outcome_summary(outcomes: &[ActionResult], hist_id: &str) {
         }
     }
 
+    render_apply_duplicate_warnings(actions, outcomes);
+
     println!();
     println!("History");
     println!("  {hist_id}");
@@ -480,11 +571,16 @@ fn render_apply_outcome_summary(outcomes: &[ActionResult], hist_id: &str) {
     }
 }
 
-pub fn organize_apply_result(path: &str, outcomes: &[ActionResult], hist_id: &str) {
+pub fn organize_apply_result(
+    path: &str,
+    actions: &[Action],
+    outcomes: &[ActionResult],
+    hist_id: &str,
+) {
     println!("Sift organize");
     println!("{path}");
     println!();
-    render_apply_outcome_summary(outcomes, hist_id);
+    render_apply_outcome_summary(actions, outcomes, hist_id);
 }
 
 // ----------------------------------------------------------------- clean
@@ -548,11 +644,16 @@ pub fn clean_dry_run(path: &str, actions: &[Action], is_project_root: bool, verb
     }
 }
 
-pub fn clean_apply_result(path: &str, outcomes: &[ActionResult], hist_id: &str) {
+pub fn clean_apply_result(
+    path: &str,
+    actions: &[Action],
+    outcomes: &[ActionResult],
+    hist_id: &str,
+) {
     println!("Sift clean");
     println!("{path}");
     println!();
-    render_apply_outcome_summary(outcomes, hist_id);
+    render_apply_outcome_summary(actions, outcomes, hist_id);
 }
 
 // ------------------------------------------------------------------ scan
@@ -1501,5 +1602,35 @@ pub fn folders_apply_result(outcomes: &[ActionResult], hist_id: &str) {
     } else if moved > 0 {
         println!();
         println!("Folder moves are not undoable in this version.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_identical_duplicate_reason() {
+        let reason = format!(
+            "{}/tmp/Documents/foo.pdf",
+            crate::planner::IDENTICAL_DUPLICATE_REASON_PREFIX
+        );
+        assert!(is_duplicate_collision_reason(&reason));
+    }
+
+    #[test]
+    fn recognizes_renamed_collision_reason() {
+        let reason = format!(
+            "Document{}",
+            crate::planner::RENAMED_COLLISION_REASON_SUFFIX
+        );
+        assert!(is_duplicate_collision_reason(&reason));
+    }
+
+    #[test]
+    fn does_not_flag_an_ordinary_reason() {
+        assert!(!is_duplicate_collision_reason("collision"));
+        assert!(!is_duplicate_collision_reason("hidden file"));
+        assert!(!is_duplicate_collision_reason("built-in junk file"));
     }
 }

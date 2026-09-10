@@ -45,9 +45,29 @@ pub fn execute_plan(
                     Err("Missing destination".to_string())
                 }
             }
-            Op::Trash => match send_to_trash(&action.src) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(format!("Trash failed: {}", e)),
+            // A duplicate-collision `Trash` (see
+            // `planner::finalize_move_action`) carries the existing file it
+            // was found identical to on `dst` — re-verify that's *still*
+            // true right before trashing, since planning and execution can
+            // be moments (or, for Watch, much longer) apart and the other
+            // file could have changed or vanished in between. An ordinary
+            // junk-file `Trash` has no `dst` and is never held to this
+            // extra check.
+            Op::Trash => match &action.dst {
+                Some(existing) => {
+                    match crate::fs::files_have_identical_content(&action.src, existing) {
+                        Ok(true) => {
+                            send_to_trash(&action.src).map_err(|e| format!("Trash failed: {}", e))
+                        }
+                        Ok(false) => Err(format!(
+                            "refusing to trash: {} is no longer identical to {}",
+                            action.src.display(),
+                            existing.display()
+                        )),
+                        Err(e) => Err(format!("cannot re-verify duplicate before trashing: {e}")),
+                    }
+                }
+                None => send_to_trash(&action.src).map_err(|e| format!("Trash failed: {}", e)),
             },
             Op::Skip => Ok(()),
         };
