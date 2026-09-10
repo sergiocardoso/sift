@@ -279,6 +279,27 @@ pub fn transition(canonical: &Path, to: WatchState) -> Result<WatchEntry, String
     })?
 }
 
+/// Changes a registered watch's `--recursive` scope after the fact
+/// (`add`'s own `recursive` parameter only ever sets it at registration
+/// time). Callers that want to refuse enabling it for a strategy that
+/// doesn't support recursion yet (mirroring `watch::cmd_watch_add`'s own
+/// check) must do that themselves before calling this — this function is
+/// pure registry bookkeeping, no policy awareness. Safe to call while the
+/// watch is `Running`: the daemon notices the change and rebuilds that
+/// root's monitor on its next reconcile (see
+/// `daemon::Daemon::reconcile`), so there's no need to pause/resume
+/// around it.
+pub fn set_recursive(canonical: &Path, recursive: bool) -> Result<WatchEntry, String> {
+    with_registry(|reg| -> Result<WatchEntry, String> {
+        let entry = reg
+            .find_mut(canonical)
+            .ok_or_else(|| format!("{} is not a registered watch", canonical.display()))?;
+        entry.recursive = recursive;
+        entry.updated_at = now_secs();
+        Ok(entry.clone())
+    })?
+}
+
 pub fn record_event(canonical: &Path) -> Result<(), String> {
     with_registry(|reg| {
         if let Some(e) = reg.find_mut(canonical) {

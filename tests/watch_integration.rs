@@ -10,10 +10,10 @@ use sift::domain::{HistoryItem, Op};
 use sift::watch::daemon::Daemon;
 use sift::watch::engine::{process_candidate, RootMonitor};
 use sift::watch::registry::{
-    self, add, clear_test_watch_dir, find, list, remove, set_test_watch_dir, transition,
-    validate_root, WatchState,
+    self, add, clear_test_watch_dir, find, list, remove, set_recursive, set_test_watch_dir,
+    transition, validate_root, WatchState,
 };
-use sift::watch::{cmd_watch_add, cmd_watch_list};
+use sift::watch::{cmd_watch_add, cmd_watch_list, cmd_watch_set_recursive};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -73,6 +73,27 @@ fn registry_add_requires_auto_apply() {
         let inbox = root.join("Inbox").canonicalize_dir();
         let err = add(inbox, false, false).unwrap_err();
         assert!(err.contains("--auto-apply"));
+    });
+}
+
+#[test]
+fn registry_set_recursive_updates_an_existing_entry() {
+    with_isolated_registry(|root| {
+        let inbox = root.join("Inbox").canonicalize_dir();
+        add(inbox.clone(), true, false).unwrap();
+        let entry = set_recursive(&inbox, true).unwrap();
+        assert!(entry.recursive);
+        // Confirms it's actually persisted, not just returned.
+        assert!(find(&inbox).unwrap().unwrap().recursive);
+    });
+}
+
+#[test]
+fn registry_set_recursive_errors_for_unregistered_path() {
+    with_isolated_registry(|root| {
+        let never_added = root.join("never-added").canonicalize_dir();
+        let err = set_recursive(&never_added, true).unwrap_err();
+        assert!(err.contains("not a registered watch"));
     });
 }
 
@@ -298,6 +319,30 @@ fn daemon_reconcile_drops_monitor_when_watch_stops() {
         transition(&w, WatchState::Stopped).unwrap();
         d.reconcile();
         assert!(!d.is_monitoring(&w));
+    });
+}
+
+#[test]
+fn daemon_reconcile_rebuilds_monitor_when_recursive_changes_while_running() {
+    with_isolated_registry(|root| {
+        let w = root.join("w").canonicalize_dir();
+        add(w.clone(), true, false).unwrap();
+        transition(&w, WatchState::Running).unwrap();
+
+        let mut d = Daemon::new().unwrap();
+        d.reconcile();
+        assert_eq!(d.monitor_recursive(&w), Some(false));
+
+        // Toggled live, the same way sift-tray's "Recursive" checkbox
+        // does — the watch stays Running throughout, no pause/resume.
+        sift::watch::registry::set_recursive(&w, true).unwrap();
+        d.reconcile();
+        assert_eq!(
+            d.monitor_recursive(&w),
+            Some(true),
+            "reconcile must rebuild the RootMonitor (and its notify watch mode) \
+             when recursive changes for an already-running watch, not keep the stale one"
+        );
     });
 }
 
@@ -874,6 +919,67 @@ fn cli_watch_add_without_auto_apply_is_rejected_by_handler() {
         let ok = cmd_watch_add(inbox.to_string_lossy().to_string(), false, false);
         assert!(!ok);
         assert!(list().unwrap().is_empty());
+    });
+}
+
+// ============================================================
+// cmd_watch_set_recursive (sift-tray's "Recursive" toggle)
+// ============================================================
+
+#[test]
+fn cmd_watch_set_recursive_enables_for_a_type_strategy_watch() {
+    with_isolated_registry(|root| {
+        let inbox = root.join("Inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let inbox = inbox.canonicalize().unwrap();
+        add(inbox.clone(), true, false).unwrap();
+
+        let ok = cmd_watch_set_recursive(inbox.to_string_lossy().to_string(), true);
+        assert!(ok);
+        assert!(find(&inbox).unwrap().unwrap().recursive);
+    });
+}
+
+#[test]
+fn cmd_watch_set_recursive_refuses_enabling_for_a_strategy_that_does_not_support_it() {
+    with_isolated_registry(|root| {
+        let inbox = root.join("Inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(
+            inbox.join(".sift.toml"),
+            "[organize]\nstrategy = \"audio\"\ntemplate = \"{artist}\"\n",
+        )
+        .unwrap();
+        let inbox = inbox.canonicalize().unwrap();
+        add(inbox.clone(), true, false).unwrap();
+
+        let ok = cmd_watch_set_recursive(inbox.to_string_lossy().to_string(), true);
+        assert!(!ok);
+        // Refused, not silently applied.
+        assert!(!find(&inbox).unwrap().unwrap().recursive);
+    });
+}
+
+#[test]
+fn cmd_watch_set_recursive_always_allows_disabling_even_for_an_unsupported_strategy() {
+    with_isolated_registry(|root| {
+        let inbox = root.join("Inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(
+            inbox.join(".sift.toml"),
+            "[organize]\nstrategy = \"audio\"\ntemplate = \"{artist}\"\n",
+        )
+        .unwrap();
+        let inbox = inbox.canonicalize().unwrap();
+        add(inbox.clone(), true, false).unwrap();
+        // Bypasses cmd_watch_add's own guard on purpose, exactly like a
+        // stale/hand-edited registry entry could end up recursive=true
+        // under a strategy that no longer supports it.
+        set_recursive(&inbox, true).unwrap();
+
+        let ok = cmd_watch_set_recursive(inbox.to_string_lossy().to_string(), false);
+        assert!(ok);
+        assert!(!find(&inbox).unwrap().unwrap().recursive);
     });
 }
 

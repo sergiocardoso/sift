@@ -220,6 +220,15 @@ impl Daemon {
         self.monitors.contains_key(root)
     }
 
+    /// The `recursive` scope `root`'s live `RootMonitor` was built with,
+    /// if it's currently being monitored — lets a test confirm that
+    /// toggling `recursive` while running actually rebuilds the monitor
+    /// (see `reconcile`'s handling of a changed `recursive` value)
+    /// instead of silently keeping the stale one.
+    pub fn monitor_recursive(&self, root: &Path) -> Option<bool> {
+        self.monitors.get(root).map(|m| m.recursive)
+    }
+
     /// Syncs live state (which roots have an active `notify` watch and a
     /// `RootMonitor`) with the registry's current `running` set. A watch
     /// that becomes paused/stopped/removed has its OS watch torn down and
@@ -233,21 +242,30 @@ impl Daemon {
             .map(|e| (e.path.clone(), e.recursive))
             .collect();
 
+        // A root drops out of `monitors` either because it's no longer
+        // running at all, or because it's still running but its
+        // `recursive` scope changed since the monitor was built (e.g.
+        // toggled from `sift-tray`) — `recursive` only ever takes effect
+        // at `RootMonitor::new`/`watcher.watch` time, so the only way to
+        // pick up a changed value is to rebuild both from scratch below.
         let to_drop: Vec<PathBuf> = self
             .monitors
-            .keys()
-            .filter(|p| !running.contains_key(*p))
-            .cloned()
+            .iter()
+            .filter(|(p, m)| match running.get(*p) {
+                None => true,
+                Some(recursive) => m.recursive != *recursive,
+            })
+            .map(|(p, _)| p.clone())
             .collect();
-        for p in to_drop {
-            self.monitors.remove(&p);
-            self.policy_cache.remove(&p);
-            self.unhealthy.remove(&p);
+        for p in &to_drop {
+            self.monitors.remove(p);
+            self.policy_cache.remove(p);
+            self.unhealthy.remove(p);
         }
         let to_unwatch: Vec<PathBuf> = self
             .watched_paths
             .iter()
-            .filter(|p| !running.contains_key(*p))
+            .filter(|p| !running.contains_key(*p) || to_drop.contains(p))
             .cloned()
             .collect();
         for p in to_unwatch {

@@ -91,6 +91,54 @@ pub fn cmd_watch_add(path: String, auto_apply: bool, recursive: bool) -> bool {
     }
 }
 
+/// Toggles a registered watch's `--recursive` scope after the fact —
+/// `sift watch add --recursive` only ever sets this at registration time
+/// otherwise. Enabling it re-runs the exact same strategy-support check
+/// `cmd_watch_add` runs (never let a metadata strategy that doesn't
+/// support recursion end up recursive); disabling it is always allowed,
+/// the same asymmetry `cmd_watch_transition` already uses for state
+/// changes (only the more active direction needs validating). Takes
+/// effect on the running daemon's next reconcile — no pause/resume
+/// needed (see `registry::set_recursive`).
+pub fn cmd_watch_set_recursive(path: String, recursive: bool) -> bool {
+    let Ok(canonical) = canonicalize_existing(&path) else {
+        eprintln!("{path}: no such directory");
+        return false;
+    };
+    if recursive {
+        match crate::config::resolve_policy(&canonical.to_string_lossy()) {
+            Ok(policy) => {
+                if !policy.strategy.supports_recursive() {
+                    eprintln!(
+                        "Refusing to enable --recursive: strategy = \"{}\" does not support it yet.",
+                        policy.strategy.as_str()
+                    );
+                    return false;
+                }
+            }
+            Err(e) => {
+                eprintln!("Refusing to enable --recursive: invalid configuration.");
+                eprintln!("{e}");
+                return false;
+            }
+        }
+    }
+    match registry::set_recursive(&canonical, recursive) {
+        Ok(entry) => {
+            println!(
+                "{}: recursive is now {}",
+                entry.path.display(),
+                if entry.recursive { "on" } else { "off" }
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            false
+        }
+    }
+}
+
 pub fn cmd_watch_remove(path: String) -> bool {
     // A registered watch's path was already made canonical once, at
     // `add` time — removing it should never require re-resolving that

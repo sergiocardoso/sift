@@ -250,9 +250,14 @@ Set `SIFT_NO_UPDATE_CHECK` (to any value) to disable this entirely — no networ
 
 ## Optional: `sift-tray` (system tray / menu bar UI)
 
-A small, entirely separate app that shows an icon near the clock (macOS menu bar, Windows/Linux tray) listing your watched folders — name, state (running/paused/stopped/config error), with "Open folder" and "Pause"/"Resume" per watch. It's a thin UI shell over the same `sift` library the CLI uses (`watch::registry::list`, the same `cmd_watch_pause`/`cmd_watch_resume` functions `sift watch pause`/`resume` call) — it never talks to the watch daemon directly and never reimplements any watch logic.
+A small, entirely separate app that shows an icon near the clock (macOS menu bar, Windows/Linux tray) listing your watched folders — name, state (running/paused/stopped/config error), with "Open folder", "Pause"/"Resume", a "Recursive" checkbox, and "Reapply now" per watch. It's a thin UI shell over the same `sift` library the CLI uses (`watch::registry::list`, the same `cmd_watch_pause`/`cmd_watch_resume` functions `sift watch pause`/`resume` call) — it never talks to the watch daemon directly and never reimplements any watch logic.
 
 Picking a folder from its "Add folder…" dialog is this app's one deliberate authorization gesture (the same contract as `--auto-apply` on the CLI): unlike `sift watch add` on the CLI — where Watch's own "never sweep pre-existing files" rule (see [Why Watch waits before moving a new file](#why-watch-waits-before-moving-a-new-file)) means a folder full of existing files sits untouched until you separately run `sift organize --apply` — the tray runs one real `sift organize --apply` pass on whatever's already in the folder *before* starting the watch, so picking a folder there organizes it immediately, not just from then on.
+
+Two more per-watch controls the CLI doesn't expose directly (only reachable through the tray, or by editing the registry file yourself — there's no `sift watch` subcommand for either yet):
+
+- **"Recursive" checkbox** — toggles `--recursive` scope for a folder *after* it's already registered (`sift watch add --recursive` on the CLI only ever sets this once, at registration time). Takes effect live, on the running daemon's very next reconcile — no need to pause/resume around it. Refuses to enable itself (silently, same as every other action here — check the checkbox state, not a popup) for a folder whose strategy doesn't support recursion yet (`audio`/`video`/`photos`/`documents`, per the "Metadata-driven organize strategies" section above); disabling it is always allowed.
+- **"Reapply now"** — runs one `sift organize --apply` pass on the folder immediately, using whatever `--recursive` scope is currently set for it. The same manual catch-up you'd otherwise run `sift organize <dir> --apply` in a terminal for — useful right after dropping in a pile of files, or right after flipping "Recursive" on, without waiting for the next filesystem event.
 
 It lives in its own workspace package specifically so installing/building the `sift` CLI never pulls in GUI dependencies (GTK on Linux, etc.).
 

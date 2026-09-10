@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{
-    AboutMetadata, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+    AboutMetadata, CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -43,6 +43,16 @@ enum Action {
     /// `bool` is whether the watch is currently running (so this toggles
     /// to the opposite state).
     TogglePause(PathBuf, bool),
+    /// `bool` is whether the watch is currently recursive (so this
+    /// toggles to the opposite scope). Takes effect on the running
+    /// daemon's very next reconcile — see
+    /// `sift::watch::registry::set_recursive`'s doc comment.
+    ToggleRecursive(PathBuf, bool),
+    /// Runs one `sift organize --apply` pass on the folder right now,
+    /// using whichever `--recursive` scope is currently registered for
+    /// it — the same manual "reapply" a user would otherwise have to
+    /// reach for a terminal to do.
+    Reapply(PathBuf),
     /// Opens a native folder picker, then registers + starts a watch on
     /// whatever folder is chosen — same `--auto-apply`, non-recursive
     /// default `sift watch add <folder> --auto-apply` uses from the CLI.
@@ -132,6 +142,27 @@ fn main() {
                             } else {
                                 sift::watch::cmd_watch_resume(path_str);
                             }
+                        }
+                        Action::ToggleRecursive(path, currently_recursive) => {
+                            let path_str = path.to_string_lossy().to_string();
+                            sift::watch::cmd_watch_set_recursive(path_str, !*currently_recursive);
+                        }
+                        Action::Reapply(path) => {
+                            // Use whatever --recursive scope is currently
+                            // registered for this watch, same as the
+                            // daemon itself would.
+                            let recursive = registry::find(path)
+                                .ok()
+                                .flatten()
+                                .map(|e| e.recursive)
+                                .unwrap_or(false);
+                            sift::planner::cmd_organize(
+                                path.to_string_lossy().to_string(),
+                                true,
+                                false,
+                                false,
+                                recursive,
+                            );
                         }
                         Action::AddFolder => {
                             // Blocks the event loop briefly while the
@@ -241,6 +272,13 @@ fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
             );
             let _ = submenu.append(&open_item);
 
+            let reapply_item = MenuItem::new("Reapply now", true, None);
+            actions.insert(
+                reapply_item.id().clone(),
+                Action::Reapply(entry.path.clone()),
+            );
+            let _ = submenu.append(&reapply_item);
+
             let running = entry.state == WatchState::Running;
             let toggle_label = if running { "Pause" } else { "Resume" };
             let toggle_item = MenuItem::new(toggle_label, true, None);
@@ -249,6 +287,18 @@ fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
                 Action::TogglePause(entry.path.clone(), running),
             );
             let _ = submenu.append(&toggle_item);
+
+            let _ = submenu.append(&PredefinedMenuItem::separator());
+
+            // Rebuilt from scratch on every refresh (like the rest of
+            // this menu), so `checked` just reflects the registry as of
+            // right now — no manual `set_checked` bookkeeping needed.
+            let recursive_item = CheckMenuItem::new("Recursive", true, entry.recursive, None);
+            actions.insert(
+                recursive_item.id().clone(),
+                Action::ToggleRecursive(entry.path.clone(), entry.recursive),
+            );
+            let _ = submenu.append(&recursive_item);
 
             let _ = submenu.append(&PredefinedMenuItem::separator());
 

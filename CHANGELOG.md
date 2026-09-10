@@ -1,6 +1,7 @@
 # Changelog
 
-## [Unreleased]
+## [v0.5.0] - 2026-09-10
+- `sift-tray` gained two new per-watch controls: a "Recursive" checkbox (toggles `--recursive` scope after a watch is already registered, taking effect live on the daemon's next reconcile — no pause/resume needed) and "Reapply now" (runs one `sift organize --apply` pass on demand). Fixed the daemon's `reconcile` to actually rebuild a root's monitor when `recursive` changes while running (it previously kept the stale value silently). Both controls are new library functions (`watch::cmd_watch_set_recursive`, reused `planner::cmd_organize`) — the CLI doesn't expose a subcommand for either yet.
 - `install.sh` now offers to install `sift-tray` too (when a prebuilt archive exists for the detected platform), interactively and opt-in only — same "never silently, never non-interactively" rule as the existing ffmpeg offer. Doesn't affect a non-interactive `curl | sh` install, which still installs only `sift`.
 
 ## [v0.4.0] - 2026-09-10
