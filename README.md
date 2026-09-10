@@ -240,6 +240,19 @@ Then:
 sift --help
 ```
 
+## Optional: `sift-tray` (system tray / menu bar UI)
+
+A small, entirely separate app that shows an icon near the clock (macOS menu bar, Windows/Linux tray) listing your watched folders — name, state (running/paused/stopped/config error), with "Open folder" and "Pause"/"Resume" per watch. It's a thin UI shell over the same `sift` library the CLI uses (`watch::registry::list`, the same `cmd_watch_pause`/`cmd_watch_resume` functions `sift watch pause`/`resume` call) — it never talks to the watch daemon directly and never reimplements any watch logic.
+
+It lives in its own workspace package specifically so installing/building the `sift` CLI never pulls in GUI dependencies (GTK on Linux, etc.):
+
+```bash
+cargo build -p sift-tray --release
+./target/release/sift-tray
+```
+
+On Linux this needs GTK3 + an AppIndicator implementation (`libayatana-appindicator3` or `libappindicator3`) available at build time — install your distro's `-dev`/`-devel` packages for those if the build fails. There's no autostart/packaging yet (no `.app` bundle, no Windows startup entry, no Linux `.desktop` autostart) — for now it's just "run the binary".
+
 ---
 
 # Quick start

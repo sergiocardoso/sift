@@ -13,3 +13,8 @@ pub mod render;
 pub mod scanner;
 pub mod utils;
 pub mod watch;
+
+/// Sift's own version (from this crate's `Cargo.toml`), for anything that
+/// wants to display it — e.g. `sift-tray`'s "About" menu item — without
+/// hardcoding a number that could drift out of sync.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

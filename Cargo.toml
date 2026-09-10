@@ -1,3 +1,11 @@
+[workspace]
+# Root-package workspace: this Cargo.toml is still the `sift` CLI package
+# itself (unchanged below), it just also lists `sift-tray` as a second
+# member. `cargo build`/`cargo install --path .` here only ever touch the
+# `sift` package (no GTK/tao/tray-icon anywhere in its dependency graph);
+# only `cargo build -p sift-tray` (or `--workspace`) pulls those in.
+members = ["sift-tray"]
+
 [package]
 name = "sift"
 version = "0.1.0"

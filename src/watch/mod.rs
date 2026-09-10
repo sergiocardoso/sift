@@ -89,13 +89,21 @@ pub fn cmd_watch_add(path: String, auto_apply: bool, recursive: bool) -> bool {
 }
 
 pub fn cmd_watch_remove(path: String) -> bool {
-    let Ok(canonical) = canonicalize_existing(&path) else {
-        eprintln!("{path}: no such directory");
-        return false;
-    };
-    match registry::remove(&canonical) {
+    // A registered watch's path was already made canonical once, at
+    // `add` time — removing it should never require re-resolving that
+    // path against the live filesystem again. If the folder still
+    // exists, canonicalizing first is what lets a relative or
+    // symlinked path the user types match the absolute path actually
+    // stored in the registry. If it doesn't (the folder was deleted,
+    // moved, or was on removable/network storage that's since gone),
+    // fall back to matching `path` as given directly against the
+    // registry — otherwise a watch on a folder that no longer exists
+    // could never be removed at all, by CLI or by `sift-tray`, even
+    // though `registry::remove` itself never touches the filesystem.
+    let target = canonicalize_existing(&path).unwrap_or_else(|_| PathBuf::from(&path));
+    match registry::remove(&target) {
         Ok(()) => {
-            println!("Removed watch: {}", canonical.display());
+            println!("Removed watch: {}", target.display());
             true
         }
         Err(e) => {

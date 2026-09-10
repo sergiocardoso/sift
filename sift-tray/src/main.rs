@@ -1,0 +1,287 @@
+//! Optional system tray / menu bar app listing sift's watched folders.
+//!
+//! Entirely separate from the `sift` CLI binary: this is a thin UI shell
+//! over the same `sift` library the CLI already uses
+//! (`watch::registry::list`, `watch::cmd_watch_pause`/`cmd_watch_resume`)
+//! — it never reimplements watch state transitions, it just calls the
+//! exact same functions the CLI calls, so behavior can never drift
+//! between the two. Never touches the watch daemon directly either: the
+//! daemon polls the registry file on its own (see
+//! `sift::watch::daemon::Daemon::reconcile`), so changing a watch's state
+//! here is picked up the same way `sift watch pause`/`resume` already is.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use tao::event::{Event, StartCause};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::menu::{
+    AboutMetadata, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+use sift::watch::registry::{self, WatchState};
+
+const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+enum UserEvent {
+    /// The tray icon itself was clicked/hovered/etc. Nothing in this app
+    /// currently reacts to it directly (only the menu items do, via
+    /// `MenuEvent`) — it's still routed through the event loop so the
+    /// `tray-icon` crate's internal state machine stays correct.
+    TrayIconEvent,
+    MenuEvent(MenuEvent),
+}
+
+/// What clicking one dynamically-built menu item does. Looked up by the
+/// `MenuId` `tray-icon`/`muda` hands back in `MenuEvent`, since the menu
+/// itself is rebuilt from scratch on every refresh (cheap, and avoids
+/// hand-rolled diffing against the registry).
+enum Action {
+    OpenFolder(PathBuf),
+    /// `bool` is whether the watch is currently running (so this toggles
+    /// to the opposite state).
+    TogglePause(PathBuf, bool),
+    /// Opens a native folder picker, then registers + starts a watch on
+    /// whatever folder is chosen — same `--auto-apply`, non-recursive
+    /// default `sift watch add <folder> --auto-apply` uses from the CLI.
+    AddFolder,
+    /// Unregisters a watch (`sift watch remove`'s exact function) —
+    /// never touches any file, only the registry entry. Reversible by
+    /// just adding the same folder back.
+    Remove(PathBuf),
+    Quit,
+}
+
+fn main() {
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+
+    let proxy = event_loop.create_proxy();
+    TrayIconEvent::set_event_handler(Some(move |_event| {
+        let _ = proxy.send_event(UserEvent::TrayIconEvent);
+    }));
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event| {
+        let _ = proxy.send_event(UserEvent::MenuEvent(event));
+    }));
+
+    let mut tray: Option<TrayIcon> = None;
+    let mut actions: HashMap<MenuId, Action> = HashMap::new();
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + REFRESH_INTERVAL);
+
+        match event {
+            Event::NewEvents(StartCause::Init) => {
+                let (menu, new_actions) = build_menu();
+                actions = new_actions;
+                tray = Some(
+                    TrayIconBuilder::new()
+                        .with_menu(Box::new(menu))
+                        .with_tooltip("sift — watched folders")
+                        .with_icon(folder_icon())
+                        .build()
+                        .expect("failed to build tray icon"),
+                );
+            }
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                refresh(&tray, &mut actions);
+            }
+            Event::UserEvent(UserEvent::MenuEvent(event)) => {
+                if let Some(action) = actions.get(&event.id) {
+                    match action {
+                        Action::OpenFolder(path) => open_in_file_manager(path),
+                        Action::TogglePause(path, currently_running) => {
+                            let path_str = path.to_string_lossy().to_string();
+                            if *currently_running {
+                                sift::watch::cmd_watch_pause(path_str);
+                            } else {
+                                sift::watch::cmd_watch_resume(path_str);
+                            }
+                        }
+                        Action::AddFolder => {
+                            // Blocks the event loop briefly while the
+                            // native dialog is open — fine for a
+                            // deliberate, infrequent user action like this.
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                let path_str = folder.to_string_lossy().to_string();
+                                if sift::watch::cmd_watch_add(path_str.clone(), true, false) {
+                                    sift::watch::cmd_watch_start(path_str);
+                                }
+                            }
+                        }
+                        Action::Remove(path) => {
+                            sift::watch::cmd_watch_remove(path.to_string_lossy().to_string());
+                        }
+                        Action::Quit => {
+                            tray.take();
+                            *control_flow = ControlFlow::Exit;
+                            return;
+                        }
+                    }
+                    refresh(&tray, &mut actions);
+                }
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Rebuilds the menu from the registry's current state and swaps it into
+/// the live tray icon. Called on every periodic tick and immediately
+/// after any action, so the menu never shows stale state for more than
+/// one tick.
+fn refresh(tray: &Option<TrayIcon>, actions: &mut HashMap<MenuId, Action>) {
+    let Some(tray) = tray else { return };
+    let (menu, new_actions) = build_menu();
+    tray.set_menu(Some(Box::new(menu)));
+    *actions = new_actions;
+}
+
+/// Reads `sift::watch::registry::list()` — the same call
+/// `sift watch list` makes — and renders "Add folder...", one submenu per
+/// watched folder (name + state indicator, "Open folder", a Pause/Resume
+/// toggle, and — separated below its own divider, to make an accidental
+/// click less likely — "Remove"), then a separator and "Quit". Returns
+/// the id → action map needed to interpret `MenuEvent`s from this menu.
+fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
+    let menu = Menu::new();
+    let mut actions = HashMap::new();
+
+    let add_item = MenuItem::new("Add folder…", true, None);
+    actions.insert(add_item.id().clone(), Action::AddFolder);
+    let _ = menu.append(&add_item);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+
+    let watches = registry::list().unwrap_or_default();
+
+    if watches.is_empty() {
+        let item = MenuItem::new("No watched folders", false, None);
+        let _ = menu.append(&item);
+    } else {
+        for entry in &watches {
+            let indicator = if entry.config_error.is_some() {
+                "⚠"
+            } else {
+                match entry.state {
+                    WatchState::Running => "●",
+                    WatchState::Paused => "⏸",
+                    WatchState::Stopped => "○",
+                }
+            };
+            let name = entry
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| entry.path.display().to_string());
+            let submenu = Submenu::new(format!("{indicator} {name}"), true);
+
+            let open_item = MenuItem::new("Open folder", true, None);
+            actions.insert(
+                open_item.id().clone(),
+                Action::OpenFolder(entry.path.clone()),
+            );
+            let _ = submenu.append(&open_item);
+
+            let running = entry.state == WatchState::Running;
+            let toggle_label = if running { "Pause" } else { "Resume" };
+            let toggle_item = MenuItem::new(toggle_label, true, None);
+            actions.insert(
+                toggle_item.id().clone(),
+                Action::TogglePause(entry.path.clone(), running),
+            );
+            let _ = submenu.append(&toggle_item);
+
+            let _ = submenu.append(&PredefinedMenuItem::separator());
+
+            let remove_item = MenuItem::new("Remove", true, None);
+            actions.insert(remove_item.id().clone(), Action::Remove(entry.path.clone()));
+            let _ = submenu.append(&remove_item);
+
+            let _ = menu.append(&submenu);
+        }
+    }
+
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    // A native "About" item — the OS shows its own About dialog (icon,
+    // name, version, description) when clicked, so there's no `Action`
+    // to route for it here.
+    let _ = menu.append(&PredefinedMenuItem::about(None, Some(about_metadata())));
+    let quit_item = MenuItem::new("Quit", true, None);
+    actions.insert(quit_item.id().clone(), Action::Quit);
+    let _ = menu.append(&quit_item);
+
+    (menu, actions)
+}
+
+/// "Sift, version x.y.z" and a short description for the native About
+/// dialog, using `sift::VERSION` (the actual `sift` package version, not
+/// this UI's own) so it can never drift out of sync.
+fn about_metadata() -> AboutMetadata {
+    AboutMetadata {
+        name: Some("Sift".to_string()),
+        version: Some(sift::VERSION.to_string()),
+        comments: Some("Local-first, safe CLI for organizing files.".to_string()),
+        website: Some("https://github.com/sergiocardoso/sift".to_string()),
+        website_label: Some("GitHub".to_string()),
+        icon: Some(about_dialog_icon()),
+        ..Default::default()
+    }
+}
+
+/// Opens `path` in the OS's native file manager — `open` on macOS,
+/// `explorer` on Windows, `xdg-open` on Linux/other Unix. No new
+/// dependency: these are the three standard system commands, dispatched
+/// by `cfg(target_os)`.
+fn open_in_file_manager(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// The real Sift logo, pre-sized and embedded at compile time (via
+/// `include_bytes!` — no network fetch, no external asset lookup at
+/// runtime) from `assets/`. Two sizes: a small one for the tray icon
+/// itself, a larger one for the About dialog (which displays it bigger).
+/// Both were downsized from the master artwork with ImageMagick once,
+/// ahead of time, rather than shipping the full-resolution PNG and
+/// resizing it in-process on every launch.
+const TRAY_ICON_PNG: &[u8] = include_bytes!("../assets/icon-tray.png");
+const ABOUT_ICON_PNG: &[u8] = include_bytes!("../assets/icon-about.png");
+
+/// Decodes an embedded PNG into `(rgba_bytes, width, height)` via the
+/// `image` crate (built with only the `png` feature — this app only ever
+/// decodes the two PNGs above, never arbitrary user-supplied images).
+fn decode_png(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
+    let img = image::load_from_memory(bytes)
+        .expect("embedded icon PNG is a fixed, known-good asset")
+        .into_rgba8();
+    let (width, height) = img.dimensions();
+    (img.into_raw(), width, height)
+}
+
+/// The tray icon itself (`tray_icon::Icon`).
+fn folder_icon() -> Icon {
+    let (rgba, width, height) = decode_png(TRAY_ICON_PNG);
+    Icon::from_rgba(rgba, width, height).expect("folder_icon: embedded PNG is always valid")
+}
+
+/// The same logo, sized for the About dialog and as the distinct
+/// `tray_icon::menu::Icon` type `AboutMetadata::icon` needs — same
+/// `from_rgba` shape, just a different concrete type from the `muda`
+/// crate `tray_icon::menu` re-exports.
+fn about_dialog_icon() -> tray_icon::menu::Icon {
+    let (rgba, width, height) = decode_png(ABOUT_ICON_PNG);
+    tray_icon::menu::Icon::from_rgba(rgba, width, height)
+        .expect("about_dialog_icon: embedded PNG is always valid")
+}

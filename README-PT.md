@@ -240,6 +240,19 @@ Depois:
 sift --help
 ```
 
+## Opcional: `sift-tray` (UI de bandeja/menu bar)
+
+Um app pequeno e totalmente separado que mostra um ícone perto do relógio (menu bar no macOS, bandeja no Windows/Linux) listando suas pastas monitoradas — nome, estado (rodando/pausado/parado/com erro de config), com "Abrir pasta" e "Pausar"/"Retomar" por watch. É uma camada de UI fina sobre a mesma biblioteca `sift` que o CLI usa (`watch::registry::list`, as mesmas funções `cmd_watch_pause`/`cmd_watch_resume` que `sift watch pause`/`resume` chamam) — nunca fala com o daemon do watch diretamente e nunca reimplementa lógica de watch.
+
+Vive no seu próprio pacote de workspace especificamente pra que instalar/compilar o CLI `sift` nunca puxe dependências gráficas (GTK no Linux etc.):
+
+```bash
+cargo build -p sift-tray --release
+./target/release/sift-tray
+```
+
+No Linux isso precisa de GTK3 + uma implementação de AppIndicator (`libayatana-appindicator3` ou `libappindicator3`) disponíveis na hora de compilar — instale os pacotes `-dev`/`-devel` da sua distro se a build falhar. Ainda não tem autostart/empacotamento (sem `.app` no macOS, sem entrada de inicialização no Windows, sem autostart via `.desktop` no Linux) — por enquanto é só "rode o binário".
+
 ---
 
 # Início rápido

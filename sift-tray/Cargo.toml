@@ -1,0 +1,14 @@
+[package]
+name = "sift-tray"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sérgio Cardoso"]
+description = "Optional system tray / menu bar UI listing sift's watched folders."
+license = "Apache-2.0"
+
+[dependencies]
+sift = { path = ".." }
+tray-icon = "0.24"
+tao = "0.37"
+rfd = "0.17.2"
+image = { version = "0.25.10", default-features = false, features = ["png"] }

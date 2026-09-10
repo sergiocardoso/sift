@@ -2,12 +2,57 @@
 //! for this MVP; other platforms get an explicit, honest error instead of
 //! a pretend/partial implementation.
 
+/// Finds the `sift` CLI binary to relaunch as the detached daemon.
+///
+/// This can't just be `std::env::current_exe()`: this function (via
+/// `watch::cmd_watch_start`/`cmd_watch_resume`) is called from *any*
+/// process linking this library, not only the `sift` CLI itself —
+/// notably `sift-tray`, whose "Add folder"/"Resume" actions call the
+/// exact same `cmd_watch_*` functions the CLI does (deliberately, to
+/// never duplicate watch logic). If `current_exe()` were used blindly,
+/// clicking those in `sift-tray` would try to relaunch *`sift-tray`*
+/// with `watch daemon run` arguments it doesn't understand — the watch
+/// state would flip to "running" in the registry, but no real daemon
+/// would ever come up, and nothing would actually get organized until
+/// someone ran `sift watch start` from a terminal by hand.
+///
+/// So: if the currently running executable is already named `sift`,
+/// it's used as-is (the common case — the CLI calling this on itself).
+/// Otherwise, look for a sibling binary literally named `sift` next to
+/// the current executable (covers `sift-tray` sitting next to `sift` in
+/// the same `target/release/` or install directory), then fall back to
+/// resolving `sift` on `PATH`.
+fn find_sift_binary() -> Result<std::path::PathBuf, String> {
+    let current = std::env::current_exe().map_err(|e| format!("cannot locate sift binary: {e}"))?;
+    if current.file_stem().and_then(|s| s.to_str()) == Some("sift") {
+        return Ok(current);
+    }
+    if let Some(sibling) = current.parent().map(|dir| dir.join("sift")) {
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("sift");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(
+        "cannot locate the \"sift\" binary (not the current executable, no sibling next to it, \
+         not on PATH)"
+            .to_string(),
+    )
+}
+
 #[cfg(unix)]
 pub fn spawn_detached_daemon(log_path: &std::path::Path) -> Result<u32, String> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate sift binary: {e}"))?;
+    let exe = find_sift_binary()?;
     let log_out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
