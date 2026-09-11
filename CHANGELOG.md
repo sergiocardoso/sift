@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.3] - 2026-09-11
+- The update-availability notice now includes the actual runnable install command (`curl -fsSL https://raw.githubusercontent.com/sergiocardoso/sift/main/install.sh | sh`) instead of telling you to "run `./install.sh` again", which assumed the script was already present in your current directory.
+
 ## [v0.7.2] - 2026-09-11
 - `sift-tray`'s tray/About icons now use the current Sift folder-and-sparkle logo instead of the old terminal-window artwork, and per-watch status indicators are colored emoji (🟢 running, ⏸️ paused, ⚪ stopped, ⚠️ config error) instead of plain glyphs. Cosmetic only — no behavior change.
 

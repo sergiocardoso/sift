@@ -136,9 +136,10 @@ fn pending_notice(latest_seen: Option<String>, current_version: &str) -> Option<
         return None;
     }
     Some(format!(
-        "A new version of sift is available: v{current_version} -> v{latest}. Run ./install.sh \
-         again to update (see https://github.com/sergiocardoso/sift#installation), or set \
-         SIFT_NO_UPDATE_CHECK=1 to stop checking."
+        "A new version of sift is available: v{current_version} -> v{latest}. To update, run:\n\n    \
+         curl -fsSL https://raw.githubusercontent.com/sergiocardoso/sift/main/install.sh | sh\n\n\
+         (see https://github.com/sergiocardoso/sift#installation), or set SIFT_NO_UPDATE_CHECK=1 \
+         to stop checking."
     ))
 }
 
