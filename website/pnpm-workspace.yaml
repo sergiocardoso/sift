@@ -1,0 +1,8 @@
+allowBuilds:
+  esbuild: true
+# esbuild (a transitive dep of Astro/Vite) ships a postinstall script that
+# just downloads its own prebuilt binary for the current platform; pnpm's
+# default script-execution policy blocks it until explicitly allowed here.
+# `pnpm build`/`pnpm dev` already work without it in this environment (the
+# platform-specific esbuild binary installs as a plain optional dependency
+# regardless), so it's left disabled rather than approved by default.

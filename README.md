@@ -37,6 +37,8 @@
   <a href="#watch--tray">Watch + Tray</a>
   ·
   <a href="#safety-model">Safety</a>
+  ·
+  <a href="./website/">Documentation</a>
 </p>
 
 ---

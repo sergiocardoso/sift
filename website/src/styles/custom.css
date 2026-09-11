@@ -1,0 +1,90 @@
+/*
+ * Sift docs theme.
+ *
+ * Dark (charcoal, slightly cool) is the primary experience — the `:root`
+ * block below defines it directly, per Starlight's own theming
+ * convention (https://starlight.astro.build/guides/css-and-tailwind/#theming).
+ * `:root[data-theme='light']` overrides the same tokens for light mode,
+ * which must stay independently legible, not just "the inverse."
+ *
+ * Accent is the Sift brand green sampled from the logo mark
+ * (`image/logo.png`, ~ rgb(93, 224, 141)); `--sl-color-accent` here is a
+ * slightly deeper working shade so accent text/links keep AA contrast
+ * against both the dark and light backgrounds, with the brighter sampled
+ * tone reserved for `-high` (dark mode links/headings) and small accent
+ * fills.
+ */
+
+:root {
+	--sl-color-white: #ffffff;
+	--sl-color-gray-1: #e6e9ec;
+	--sl-color-gray-2: #c4cad1;
+	--sl-color-gray-3: #98a1ab;
+	--sl-color-gray-4: #6b7480;
+	--sl-color-gray-5: #454e59;
+	--sl-color-gray-6: #262d36;
+	--sl-color-gray-7: #1a1f27;
+	--sl-color-black: #0d1117;
+
+	--sl-color-accent-low: #143523;
+	--sl-color-accent: #2fbf78;
+	--sl-color-accent-high: #92f0bf;
+
+	/* A hair darker than --sl-color-gray-7 so the sidebar/nav read as a
+	   distinct surface from the page body, without a hard seam. */
+	--sl-color-bg-sidebar: #14181f;
+	--sl-color-bg-nav: #14181f;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #d7f5e3;
+	--sl-color-accent: #1f8f57;
+	--sl-color-accent-high: #146239;
+
+	--sl-color-white: #14181d;
+	--sl-color-gray-1: #262b31;
+	--sl-color-gray-2: #3f4650;
+	--sl-color-gray-3: #5c6570;
+	--sl-color-gray-4: #88919b;
+	--sl-color-gray-5: #bcc2c9;
+	--sl-color-gray-6: #e3e7ea;
+	--sl-color-gray-7: #f3f5f6;
+	--sl-color-black: #ffffff;
+
+	--sl-color-bg-sidebar: #f6f8f9;
+	--sl-color-bg-nav: #f6f8f9;
+}
+
+/* Code blocks: a touch darker than the page background in dark mode (own
+   surface, like the sidebar) and a clean off-white in light mode — never
+   pure white-on-white with the page body. */
+:root {
+	--sl-color-bg-inline-code: var(--sl-color-gray-6);
+}
+
+.expressive-code,
+.expressive-code pre {
+	--ec-brdRad: 8px;
+}
+
+/* Discrete cards: a hairline border instead of Starlight's default drop
+   shadow, so the home page's pillar grid reads as calm/technical rather
+   than glossy. */
+.sl-flex.starlight-aside,
+.card {
+	box-shadow: none !important;
+	border: 1px solid var(--sl-color-hairline, var(--sl-color-gray-5));
+}
+
+/* Hero tagline: Starlight's default is fairly small for a product with a
+   one-line pitch this central. */
+.hero .tagline {
+	font-size: clamp(1.1rem, 1rem + 0.6vw, 1.4rem);
+	color: var(--sl-color-gray-2);
+}
+
+/* Selection color matches the brand instead of the browser default blue. */
+::selection {
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-white);
+}

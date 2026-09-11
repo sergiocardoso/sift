@@ -1,0 +1,132 @@
+---
+title: Sift
+description: Safe, local-first file organization. Preview changes, apply explicitly, undo safely.
+template: splash
+head:
+  - tag: title
+    content: 'Sift — Safe, local-first file organization'
+hero:
+  title: Sift
+  tagline: Safe, local-first file organization.
+  image:
+    file: ../../assets/logo.png
+  actions:
+    - text: Get started
+      link: /getting-started/introduction/
+      icon: right-arrow
+      variant: primary
+    - text: Installation
+      link: /getting-started/installation/
+      icon: rocket
+      variant: minimal
+    - text: View on GitHub
+      link: https://github.com/sergiocardoso/sift
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<p style="text-align: center; max-width: 46rem; margin: -1.5rem auto 3rem; font-size: var(--sl-text-lg); color: var(--sl-color-gray-2);">
+	Preview changes. Apply explicitly. Undo safely.<br />
+	Keep messy folders organized without giving up control.
+</p>
+
+<CardGrid stagger>
+	<Card title="Dry-run by default" icon="seti:lock">
+		Every command is a preview until you explicitly add `--apply`. Nothing moves or gets trashed before that.
+	</Card>
+	<Card title="Undo built in" icon="rewind">
+		Successful moves are recorded as history and can be safely reversed with `sift undo`.
+	</Card>
+	<Card title="Explain every decision" icon="magnifier">
+		`sift explain <file>` shows exactly why a file was classified, skipped, protected, or moved — before or after the fact.
+	</Card>
+	<Card title="Per-folder rules" icon="setting">
+		Drop a `.sift.toml` into any directory to give it its own strategy, rules, and Watch behavior.
+	</Card>
+	<Card title="Watch" icon="approve-check-circle">
+		Turn selected folders into continuously organized inboxes, with explicit, persistent authorization.
+	</Card>
+	<Card title="Tray app" icon="laptop">
+		An optional desktop tray UI for managing watched folders without keeping a terminal open.
+	</Card>
+</CardGrid>
+
+## Why Sift?
+
+Folders accumulate entropy — a `Downloads` directory starts with a few PDFs and screenshots and ends up a mix of documents, archives, videos, datasets, and forgotten project folders. Manual cleanup doesn't scale, one-off shell scripts are risky to reuse, and AI-based organizers can be hard to predict or audit.
+
+Sift takes a different approach:
+
+- **Predictable** — classification is deterministic, based on filenames, extensions, metadata, and explicit rules. The same input always produces the same plan.
+- **Safe by default** — no `--apply`, no mutation. Existing destinations are never silently overwritten, directory trees are never automatically merged, and software projects are protected outright.
+- **Local-first** — core organization runs entirely on your machine. No cloud service and no AI are required.
+- **Controlled automation** — Watch keeps a folder continuously organized, but only after explicit, persistent authorization (`--auto-apply`), and only for files that arrive from that point on.
+- **Per-folder rules** — a `.sift.toml` file lets any directory define its own organize strategy and declarative rules, which always take precedence over the built-in defaults.
+
+## See it in action
+
+```bash
+sift organize ~/Downloads
+```
+
+```text
+invoice.pdf      → Documents/
+vacation.jpg     → Images/
+backup.zip       → Archives/
+notes.xyz        → Other/
+my-project/      → protected: software project
+
+No changes made.
+Run with --apply to execute.
+```
+
+Happy with the plan? Apply it:
+
+```bash
+sift organize ~/Downloads --apply
+```
+
+```text
+✓ Applied successfully
+
+3 files moved
+3 directories created
+1 entry skipped
+0 failures
+
+History
+  hist-...
+```
+
+Changed your mind? `sift undo hist-...` reverses it.
+
+<CardGrid>
+	<Card title=".sift.toml" icon="document">
+		Every directory can define its own policy: strategy, unknown-file handling, Watch stability, and declarative rules.
+
+		```toml
+		version = 1
+
+		[organize]
+		strategy = "type"
+		unknown = "other"
+
+		[[rules]]
+		enabled = true
+		priority = 100
+		pattern = "*.tmp"
+		action = "Trash"
+		```
+	</Card>
+	<Card title="Watch + Tray" icon="rocket">
+		Register a folder once, and Sift keeps it organized as new files arrive — stable-file detection avoids half-downloaded files. Manage every watched folder visually from the optional tray app: open, pause, reapply, or toggle recursive mode, without a terminal.
+
+		```bash
+		sift watch add ~/Inbox --auto-apply
+		sift watch start ~/Inbox
+		sift watch tray
+		```
+	</Card>
+</CardGrid>
