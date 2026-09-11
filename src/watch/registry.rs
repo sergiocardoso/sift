@@ -110,6 +110,32 @@ pub struct WatchEntry {
     /// asked for. Cleared the moment the policy becomes valid again.
     #[serde(default)]
     pub config_error: Option<String>,
+    /// Bumped by `transition` every time this watch moves *into*
+    /// `Running` (start or resume). Exists so `monitoring_generation`
+    /// below can never be mistaken for stale: it only ever means "the
+    /// daemon is live-monitoring this exact run", never any earlier one.
+    #[serde(default)]
+    pub run_generation: u64,
+    /// Live daemon readiness — distinct from the persisted `state` above,
+    /// which is only the *requested* state. `Some(g)` means the daemon has
+    /// confirmed (via `registry::mark_monitoring_ready`) that a real
+    /// `notify` watch is installed for this root as of `run_generation ==
+    /// g`. Always cleared by `transition` (any state change invalidates
+    /// it) and by the daemon itself the moment it tears the monitor down
+    /// (pause/stop/remove/rebuild) — never left to look current when the
+    /// monitor it describes no longer exists.
+    #[serde(default)]
+    pub monitoring_generation: Option<u64>,
+    /// The pause/stop counterpart to `monitoring_generation`: `Some(g)`
+    /// means the daemon has confirmed (via `registry::mark_torn_down`)
+    /// that it has actually torn down the live monitor — OS `notify`
+    /// watch unregistered, pending candidates discarded — that was
+    /// serving `run_generation == g`. `sift watch pause`/`stop` wait on
+    /// this before reporting success, so "no longer being monitored" is
+    /// an observed fact rather than an assumption about the daemon's
+    /// poll cadence.
+    #[serde(default)]
+    pub torn_down_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -222,6 +248,9 @@ pub fn add(canonical: PathBuf, auto_apply: bool, recursive: bool) -> Result<Watc
             organized_count: 0,
             error_count: 0,
             config_error: None,
+            run_generation: 0,
+            monitoring_generation: None,
+            torn_down_generation: None,
         };
         reg.watches.push(entry.clone());
         Ok(entry)
@@ -275,8 +304,78 @@ pub fn transition(canonical: &Path, to: WatchState) -> Result<WatchEntry, String
         // stale suspension notice from a previous run is cleared on any
         // explicit state change, not left to look current when it isn't.
         entry.config_error = None;
+        // Live daemon readiness is a separate signal from the requested
+        // `state` above (see `monitoring_generation`'s docs) — any
+        // transition invalidates whatever the daemon last reported, and a
+        // transition *into* Running mints a fresh generation so a stale
+        // readiness ack from a previous run can never be mistaken for
+        // this one's.
+        entry.monitoring_generation = None;
+        if to == WatchState::Running {
+            entry.run_generation += 1;
+            // Whatever this says is about a generation that's now
+            // strictly in the past — never cleared on the way *into*
+            // Paused/Stopped, since it's exactly the fact `watch
+            // pause`/`stop` wait on (see `mark_torn_down`), and a
+            // `Paused -> Stopped` transition must see an already-true
+            // ack from the earlier pause rather than block waiting for a
+            // daemon that has no further work left to do for this root.
+            entry.torn_down_generation = None;
+        }
         Ok(entry.clone())
     })?
+}
+
+/// Called by the daemon (never the CLI) once `root`'s `RootMonitor`
+/// exists and `watcher.watch(...)` has actually succeeded for it, for
+/// `generation` as read from the registry entry during that reconcile
+/// tick. Only takes effect if `generation` still matches the entry's
+/// *current* `run_generation` — if the watch was stopped/started again
+/// since that tick began, `run_generation` has already moved on and this
+/// write is silently dropped, which is what keeps a late, in-flight ack
+/// from ever marking a newer run ready before the daemon has actually
+/// caught up to it.
+pub fn mark_monitoring_ready(canonical: &Path, generation: u64) -> Result<(), String> {
+    with_registry(|reg| {
+        if let Some(e) = reg.find_mut(canonical) {
+            if e.run_generation == generation && e.monitoring_generation != Some(generation) {
+                e.monitoring_generation = Some(generation);
+                e.updated_at = now_secs();
+            }
+        }
+    })
+}
+
+/// Called by the daemon whenever `root`'s live monitor is torn down
+/// (paused, stopped, removed, or rebuilt for a changed `recursive`
+/// scope) — readiness must never outlive the monitor it describes.
+pub fn clear_monitoring_ready(canonical: &Path) -> Result<(), String> {
+    with_registry(|reg| {
+        if let Some(e) = reg.find_mut(canonical) {
+            if e.monitoring_generation.is_some() {
+                e.monitoring_generation = None;
+                e.updated_at = now_secs();
+            }
+        }
+    })
+}
+
+/// The pause/stop counterpart to `mark_monitoring_ready`: called by the
+/// daemon (never the CLI) once it has actually torn down the live
+/// monitor — OS `notify` watch unregistered, pending candidates
+/// discarded — that was serving `generation`. `sift watch pause`/`stop`
+/// wait on this (see `daemon::wait_until_torn_down`) so "no longer being
+/// monitored" is something the daemon confirmed, not something the CLI
+/// merely requested and hoped landed before returning.
+pub fn mark_torn_down(canonical: &Path, generation: u64) -> Result<(), String> {
+    with_registry(|reg| {
+        if let Some(e) = reg.find_mut(canonical) {
+            if e.torn_down_generation != Some(generation) {
+                e.torn_down_generation = Some(generation);
+                e.updated_at = now_secs();
+            }
+        }
+    })
 }
 
 /// Changes a registered watch's `--recursive` scope after the fact

@@ -1,10 +1,23 @@
 //! The single background watch daemon: one OS-level singleton lock, one
-//! `notify` watcher, one poll loop that reconciles the registry, drains
-//! filesystem events into per-root candidate trackers, and hands
-//! stabilized candidates to `engine::process_candidate`. Never mutates
-//! directly from a `notify` callback — events only ever land in a
-//! `RootMonitor`; mutation happens later, from the poll loop, after
-//! stability and live revalidation.
+//! poll loop that reconciles the registry, drains filesystem events into
+//! per-root candidate trackers, and hands stabilized candidates to
+//! `engine::process_candidate`. Never mutates directly from a `notify`
+//! callback — events only ever land in a `RootMonitor`; mutation happens
+//! later, from the poll loop, after stability and live revalidation.
+//!
+//! Each currently-`running` root gets its **own** `notify::Watcher`
+//! instance (see `WatchedRoot`), created fresh every time that root's
+//! `run_generation` changes — never one `Watcher` shared across roots or
+//! reused across generations. That's deliberate: the watcher's callback
+//! closure captures the generation it was built for *by value*, so every
+//! `ObservedEvent` it ever sends — no matter how late `notify`/the OS
+//! actually delivers it — carries the generation it truly originated
+//! under. This is what lets `drain_events` refuse a stale event from an
+//! earlier, already-torn-down generation deterministically, without
+//! trusting `notify`'s delivery timing (undocumented and backend-specific)
+//! or the event's own file metadata (which a legitimately new file can
+//! easily carry misleading old values for — `cp -p`, `rsync -a`, archive
+//! extraction, restores).
 
 use super::engine::{process_candidate, RootMonitor};
 use super::registry::{self, WatchState};
@@ -15,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -99,11 +112,6 @@ pub fn request_stop_and_wait(timeout: Duration) -> Result<bool, String> {
     Ok(matches!(daemon_status(), DaemonStatus::NotRunning))
 }
 
-/// Owns the live daemon state: the notify watcher/channel, and one
-/// `RootMonitor` per currently-`running` watch. Exposed as a struct (not a
-/// bare `run()` loop) specifically so tests can drive `reconcile` /
-/// `drain_events` / `process_ready` deterministically without needing a
-/// real detached background process.
 /// One root's cached, already-resolved policy (or the error that made it
 /// invalid), keyed by the local `.sift.toml`'s mtime at the time it was
 /// resolved — `None` means no local file existed at that time. This is
@@ -114,11 +122,43 @@ struct CachedPolicy {
     resolved: Result<EffectivePolicy, String>,
 }
 
+/// One filesystem event as observed by a specific root's watcher, tagged
+/// with the `run_generation` that watcher was built for — baked in when
+/// the watcher's callback closure was created (see `Daemon::build_watcher`),
+/// never reevaluated afterward. This is what makes a stale event from an
+/// earlier, already-torn-down generation structurally impossible to
+/// confuse with a current one, no matter when `notify`/the OS actually
+/// gets around to delivering it.
+struct ObservedEvent {
+    path: PathBuf,
+    generation: u64,
+}
+
+/// Everything the daemon owns for one currently-monitored root: its
+/// candidate tracker, the `run_generation` it was built for, and the
+/// `notify::Watcher` instance dedicated to it. The watcher is never
+/// shared across roots or reused across generations — see the module
+/// docs for why. Never read directly (hence the leading underscore) —
+/// its entire purpose is to stay alive exactly as long as `WatchedRoot`
+/// does, so dropping a `WatchedRoot` (see `reconcile`'s `to_drop`
+/// handling) drops it along too, which unregisters the OS watch as an
+/// ordinary `Drop` side effect; there is no separate `unwatch()` step to
+/// remember.
+struct WatchedRoot {
+    monitor: RootMonitor,
+    generation: u64,
+    _watcher: RecommendedWatcher,
+}
+
+/// Owns the live daemon state: one dedicated `notify` watcher and
+/// candidate tracker per currently-monitored root. Exposed as a struct
+/// (not a bare `run()` loop) specifically so tests can drive `reconcile`
+/// / `drain_events` / `process_ready` deterministically without needing a
+/// real detached background process.
 pub struct Daemon {
-    watcher: RecommendedWatcher,
-    rx: Receiver<notify::Event>,
-    monitors: HashMap<PathBuf, RootMonitor>,
-    watched_paths: HashSet<PathBuf>,
+    tx: Sender<ObservedEvent>,
+    rx: Receiver<ObservedEvent>,
+    roots: HashMap<PathBuf, WatchedRoot>,
     policy_cache: HashMap<PathBuf, CachedPolicy>,
     /// Roots whose policy is *currently* known to be invalid — automatic
     /// mutation is suspended for exactly these roots. Tracked in memory
@@ -131,19 +171,28 @@ pub struct Daemon {
 impl Daemon {
     pub fn new() -> Result<Self, String> {
         let (tx, rx) = channel();
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                let _ = tx.send(event);
-            }
-        })
-        .map_err(|e| format!("cannot create filesystem watcher: {e}"))?;
         Ok(Self {
-            watcher,
+            tx,
             rx,
-            monitors: HashMap::new(),
-            watched_paths: HashSet::new(),
+            roots: HashMap::new(),
             policy_cache: HashMap::new(),
             unhealthy: HashSet::new(),
+        })
+    }
+
+    /// Builds a brand-new `notify::Watcher` dedicated to `path`, whose
+    /// callback tags every event it will ever produce with `generation` —
+    /// fixed at closure-creation time, never looked up again later. Does
+    /// not install the OS-level watch itself; the caller still calls
+    /// `.watch(path, mode)` on the result.
+    fn build_watcher(&self, generation: u64) -> Result<RecommendedWatcher, notify::Error> {
+        let tx = self.tx.clone();
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                for path in event.paths {
+                    let _ = tx.send(ObservedEvent { path, generation });
+                }
+            }
         })
     }
 
@@ -205,8 +254,8 @@ impl Daemon {
                 let just_became_unhealthy = self.unhealthy.insert(root.to_path_buf());
                 let _ = registry::set_config_health(root, Some(e.clone()));
                 if just_became_unhealthy {
-                    if let Some(m) = self.monitors.get_mut(root) {
-                        m.discard_pending();
+                    if let Some(w) = self.roots.get_mut(root) {
+                        w.monitor.discard_pending();
                     }
                 }
             }
@@ -214,78 +263,124 @@ impl Daemon {
         resolved
     }
 
-    /// Whether `root` currently has a live `RootMonitor` (i.e. is actually
+    /// Whether `root` currently has a live `WatchedRoot` (i.e. is actually
     /// being watched right now, as of the last `reconcile`).
     pub fn is_monitoring(&self, root: &Path) -> bool {
-        self.monitors.contains_key(root)
+        self.roots.contains_key(root)
     }
 
-    /// The `recursive` scope `root`'s live `RootMonitor` was built with,
-    /// if it's currently being monitored — lets a test confirm that
-    /// toggling `recursive` while running actually rebuilds the monitor
-    /// (see `reconcile`'s handling of a changed `recursive` value)
-    /// instead of silently keeping the stale one.
+    /// The `recursive` scope `root`'s live monitor was built with, if
+    /// it's currently being monitored — lets a test confirm that toggling
+    /// `recursive` while running actually rebuilds the monitor (see
+    /// `reconcile`'s handling of a changed `recursive` value) instead of
+    /// silently keeping the stale one.
     pub fn monitor_recursive(&self, root: &Path) -> Option<bool> {
-        self.monitors.get(root).map(|m| m.recursive)
+        self.roots.get(root).map(|w| w.monitor.recursive)
     }
 
-    /// Syncs live state (which roots have an active `notify` watch and a
-    /// `RootMonitor`) with the registry's current `running` set. A watch
-    /// that becomes paused/stopped/removed has its OS watch torn down and
-    /// its pending (not-yet-stable) candidates discarded here — this *is*
-    /// the "safely stop" behavior; there is no separate step.
+    /// Syncs live state (which roots have a dedicated `notify` watcher and
+    /// candidate tracker) with the registry's current `running` set. A
+    /// watch that becomes paused/stopped/removed — or whose
+    /// `run_generation` moved on even while nominally staying `Running`
+    /// (a pause immediately followed by a resume, both landing between
+    /// two `reconcile` calls) — has its `WatchedRoot` dropped here,
+    /// tearing down its dedicated OS watch and discarding its pending
+    /// (not-yet-stable) candidates as an ordinary consequence of the drop;
+    /// there is no separate "safely stop" step.
     pub fn reconcile(&mut self) {
         let entries = registry::list().unwrap_or_default();
-        let running: HashMap<PathBuf, bool> = entries
+        let running: HashMap<PathBuf, (bool, u64)> = entries
             .iter()
             .filter(|e| e.state == WatchState::Running)
-            .map(|e| (e.path.clone(), e.recursive))
+            .map(|e| (e.path.clone(), (e.recursive, e.run_generation)))
             .collect();
 
-        // A root drops out of `monitors` either because it's no longer
-        // running at all, or because it's still running but its
-        // `recursive` scope changed since the monitor was built (e.g.
-        // toggled from `sift-tray`) — `recursive` only ever takes effect
-        // at `RootMonitor::new`/`watcher.watch` time, so the only way to
-        // pick up a changed value is to rebuild both from scratch below.
+        // A root drops out of `roots` because it's no longer running at
+        // all, because its `recursive` scope changed since the monitor
+        // was built (e.g. toggled from `sift-tray` — only takes effect at
+        // watcher-creation time), or because its `run_generation` moved
+        // on without `running` ever visibly dropping it. Any of these
+        // forces a full rebuild — a fresh `WatchedRoot`, fresh
+        // `StabilityTracker`, fresh dedicated watcher tagging events with
+        // the new generation.
         let to_drop: Vec<PathBuf> = self
-            .monitors
+            .roots
             .iter()
-            .filter(|(p, m)| match running.get(*p) {
+            .filter(|(p, w)| match running.get(*p) {
                 None => true,
-                Some(recursive) => m.recursive != *recursive,
+                Some((recursive, generation)) => {
+                    w.monitor.recursive != *recursive || w.generation != *generation
+                }
             })
             .map(|(p, _)| p.clone())
             .collect();
         for p in &to_drop {
-            self.monitors.remove(p);
+            // Dropping `WatchedRoot` drops its `watcher` field, which
+            // unregisters the OS-level watch — no manual `unwatch()`.
+            if let Some(dropped) = self.roots.remove(p) {
+                // Acknowledge teardown only now that the real watcher is
+                // actually gone and every in-memory structure for that
+                // generation is gone with it. This is what `sift watch
+                // pause`/`stop` wait on (see `wait_until_torn_down`) so
+                // "no longer being monitored" is a fact the daemon
+                // observed, not a guess about its poll cadence.
+                let _ = registry::mark_torn_down(p, dropped.generation);
+            }
             self.policy_cache.remove(p);
             self.unhealthy.remove(p);
-        }
-        let to_unwatch: Vec<PathBuf> = self
-            .watched_paths
-            .iter()
-            .filter(|p| !running.contains_key(*p) || to_drop.contains(p))
-            .cloned()
-            .collect();
-        for p in to_unwatch {
-            let _ = self.watcher.unwatch(&p);
-            self.watched_paths.remove(&p);
+            // The live monitor this readiness ack described is gone —
+            // never leave a stale "ready" behind it (see `watch start`'s
+            // wait in `super::cmd_watch_transition`, which would
+            // otherwise have no way to notice the root stopped being
+            // watched).
+            let _ = registry::clear_monitoring_ready(p);
         }
 
-        for (path, recursive) in &running {
-            self.monitors
-                .entry(path.clone())
-                .or_insert_with(|| RootMonitor::new(path.clone(), *recursive));
-            if !self.watched_paths.contains(path) {
-                let mode = if *recursive {
-                    RecursiveMode::Recursive
-                } else {
-                    RecursiveMode::NonRecursive
-                };
-                if self.watcher.watch(path, mode).is_ok() {
-                    self.watched_paths.insert(path.clone());
+        for (path, (recursive, generation)) in &running {
+            if !self.roots.contains_key(path) {
+                match self.build_watcher(*generation) {
+                    Ok(mut watcher) => {
+                        let mode = if *recursive {
+                            RecursiveMode::Recursive
+                        } else {
+                            RecursiveMode::NonRecursive
+                        };
+                        if watcher.watch(path, mode).is_ok() {
+                            self.roots.insert(
+                                path.clone(),
+                                WatchedRoot {
+                                    monitor: RootMonitor::new(path.clone(), *recursive),
+                                    generation: *generation,
+                                    _watcher: watcher,
+                                },
+                            );
+                            // This is the one place a root's dedicated
+                            // `notify` watch actually comes into
+                            // existence — only from here can it be true
+                            // that a filesystem event for `path` will
+                            // ever reach `drain_events`. Ack it
+                            // immediately, so `watch start`/`resume` can
+                            // stop waiting the instant it's real.
+                            let _ = registry::mark_monitoring_ready(path, *generation);
+                        }
+                        // If `.watch()` failed, `watcher` is simply
+                        // dropped here (nothing was ever registered) —
+                        // `reconcile` will just try again next tick.
+                    }
+                    Err(_) => {
+                        // Couldn't even create a watcher this tick —
+                        // retry on the next `reconcile`.
+                    }
                 }
+            } else {
+                // Already watching at exactly this generation — ack it
+                // again every tick, not only the tick that just installed
+                // it. A pause immediately followed by a resume (both
+                // within one poll interval) never shows up in `to_drop`
+                // at all if this loop only acked on fresh installs, so
+                // `watch resume`'s wait would time out despite the watch
+                // having been live the entire time.
+                let _ = registry::mark_monitoring_ready(path, *generation);
             }
             // Resolve/refresh this root's policy every reconcile — cheap
             // (mtime-cached), and this is what makes hot reload and
@@ -298,6 +393,16 @@ impl Daemon {
     /// Drains whatever `notify` events have arrived within `timeout` into
     /// the matching root's `RootMonitor`. Never plans or executes anything
     /// here — only records that a path might be a candidate.
+    ///
+    /// Every event carries the generation the *specific watcher instance*
+    /// that produced it was built for (see `ObservedEvent`/`build_watcher`).
+    /// An event whose tag doesn't match the root's *current* generation is
+    /// dropped here unconditionally — this is the structural guarantee
+    /// that a late-delivered event from an earlier, already-torn-down
+    /// generation can never be misattributed to a freshly rebuilt monitor,
+    /// independent of `notify`'s delivery timing and independent of the
+    /// underlying file's own metadata (which a legitimately new file can
+    /// easily carry misleading old values for).
     pub fn drain_events(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
@@ -306,26 +411,27 @@ impl Daemon {
                 break;
             }
             match self.rx.recv_timeout(remaining) {
-                Ok(event) => {
+                Ok(ObservedEvent { path, generation }) => {
                     let now = Instant::now();
                     let unhealthy = &self.unhealthy;
-                    for path in event.paths {
-                        if let Some((root, monitor)) = self
-                            .monitors
-                            .iter_mut()
-                            .find(|(root, _)| path.starts_with(root.as_path()))
-                        {
-                            // Never even start tracking a candidate while
-                            // this root's policy is broken — it must not
-                            // be backfilled once the policy is fixed, and
-                            // the simplest way to guarantee that is to
-                            // never have observed it in the first place.
-                            if unhealthy.contains(root) {
-                                continue;
-                            }
-                            let _ = registry::record_event(root);
-                            monitor.observe_event(&path, now);
+                    if let Some((root, watched)) = self
+                        .roots
+                        .iter_mut()
+                        .find(|(root, _)| path.starts_with(root.as_path()))
+                    {
+                        if watched.generation != generation {
+                            continue;
                         }
+                        // Never even start tracking a candidate while
+                        // this root's policy is broken — it must not be
+                        // backfilled once the policy is fixed, and the
+                        // simplest way to guarantee that is to never have
+                        // observed it in the first place.
+                        if unhealthy.contains(root) {
+                            continue;
+                        }
+                        let _ = registry::record_event(root);
+                        watched.monitor.observe_event(&path, now);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => break,
@@ -354,7 +460,7 @@ impl Daemon {
         let unhealthy = self.unhealthy.clone();
         let policy_cache = &self.policy_cache;
         let builtin = CategoryDB::default();
-        for (root, monitor) in self.monitors.iter_mut() {
+        for (root, watched) in self.roots.iter_mut() {
             if unhealthy.contains(root) {
                 continue;
             }
@@ -364,40 +470,69 @@ impl Daemon {
             else {
                 continue;
             };
-            let ready = monitor.poll_ready(now, policy.stability);
+            let ready = watched.monitor.poll_ready(now, policy.stability);
             if ready.is_empty() {
                 continue;
             }
             for path in ready {
+                // Re-authorize immediately before every mutation. Every
+                // in-memory field checked above (`self.roots`,
+                // `self.unhealthy`, `self.policy_cache`) is only ever as
+                // fresh as this tick's `reconcile()` call — and a
+                // concurrent `sift watch pause`/`stop` (a separate
+                // process, writing straight to the shared registry) can
+                // land at any wall-clock instant, including exactly
+                // between this tick's `reconcile()` and this exact
+                // `process_ready()` call, with no intervening reconcile
+                // to notice it. A stale in-memory "yes" must never stand
+                // in for a fresh check right here: re-read the registry
+                // and confirm both that the requested state is still
+                // Running *and* that the generation this monitor was
+                // built for still matches the current one (a pause
+                // immediately followed by a resume bumps the generation
+                // without ever visibly dropping `Running`). This is
+                // distinct from — and still needed alongside —
+                // `drain_events`'s per-event generation tag: that guards
+                // whether a candidate is *tracked* at all; this guards
+                // whether an already-legitimately-tracked candidate is
+                // still *authorized* by the time it's actually mutated.
+                let authorized = matches!(
+                    registry::find(root),
+                    Ok(Some(e)) if e.state == WatchState::Running && e.run_generation == watched.generation
+                );
+                if !authorized {
+                    continue;
+                }
                 let containing_dir = path.parent().unwrap_or(root.as_path());
                 let resolved;
-                let candidate_policy = if monitor.recursive && containing_dir != root.as_path() {
-                    match crate::config::resolve_nested_policy_override(root, containing_dir) {
-                        Some(Ok((p, owner))) => {
-                            // The owning directory's own strategy doesn't
-                            // support recursion, and this candidate lives
-                            // deeper than that directory — same boundary
-                            // `plan_recursive_nested` enforces for manual
-                            // recursive organize, applied here to one live
-                            // candidate instead of a whole tree walk.
-                            if !p.strategy.supports_recursive() && containing_dir != owner {
-                                continue;
+                let candidate_policy =
+                    if watched.monitor.recursive && containing_dir != root.as_path() {
+                        match crate::config::resolve_nested_policy_override(root, containing_dir) {
+                            Some(Ok((p, owner))) => {
+                                // The owning directory's own strategy doesn't
+                                // support recursion, and this candidate lives
+                                // deeper than that directory — same boundary
+                                // `plan_recursive_nested` enforces for manual
+                                // recursive organize, applied here to one live
+                                // candidate instead of a whole tree walk.
+                                if !p.strategy.supports_recursive() && containing_dir != owner {
+                                    continue;
+                                }
+                                resolved = p;
+                                &resolved
                             }
-                            resolved = p;
-                            &resolved
+                            // An invalid nested `.sift.toml` fails closed for
+                            // just this one candidate — never the whole
+                            // (otherwise healthy) root, and never recorded as a
+                            // root-level error.
+                            Some(Err(_)) => continue,
+                            // No override anywhere between here and root: root's
+                            // own cached policy governs, exactly as before.
+                            None => policy,
                         }
-                        // An invalid nested `.sift.toml` fails closed for
-                        // just this one candidate — never the whole
-                        // (otherwise healthy) root, and never recorded as a
-                        // root-level error.
-                        Some(Err(_)) => continue,
-                        // No override anywhere between here and root: root's
-                        // own cached policy governs, exactly as before.
-                        None => policy,
-                    }
-                } else {
-                    policy
-                };
+                    } else {
+                        policy
+                    };
                 let outcome = process_candidate(root, candidate_policy, &builtin, &path);
                 if outcome.organized {
                     let _ = registry::record_success(root, 1);
@@ -413,9 +548,10 @@ impl Daemon {
     }
 
     fn shutdown(mut self) {
-        for p in self.watched_paths.clone() {
-            let _ = self.watcher.unwatch(&p);
-        }
+        // Dropping every `WatchedRoot` (and the `notify::Watcher` each
+        // one owns) unregisters every OS-level watch as an ordinary
+        // `Drop` side effect.
+        self.roots.clear();
         let _ = fs::remove_file(registry::daemon_stop_path());
         let _ = fs::remove_file(registry::daemon_info_path());
     }
@@ -487,4 +623,292 @@ pub fn ensure_running(wait: Duration) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     Err("daemon did not report as running within the expected time".to_string())
+}
+
+/// Bounded wait for `root` to be actively monitored at exactly
+/// `generation` — i.e. for some daemon `reconcile()` tick to have called
+/// `registry::mark_monitoring_ready(root, generation)` after successfully
+/// installing a real `notify` watch for it. Polls the shared on-disk
+/// registry (the only channel between this process and the daemon
+/// process) rather than sleeping a fixed amount and hoping; returns as
+/// soon as readiness is observed, or `false` once `timeout` elapses
+/// without it. This is what lets `watch start`/`watch resume` (see
+/// `super::cmd_watch_transition`) hold off printing success until a file
+/// created the instant afterward is guaranteed not to race an
+/// as-yet-uninstalled watcher.
+pub fn wait_until_monitoring(root: &Path, generation: u64, timeout: Duration) -> bool {
+    const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    let start = Instant::now();
+    loop {
+        if let Ok(Some(entry)) = registry::find(root) {
+            if entry.monitoring_generation == Some(generation) {
+                return true;
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(READINESS_POLL_INTERVAL);
+    }
+}
+
+/// Bounded wait for `root`'s live monitor to be confirmed torn down —
+/// the pause/stop counterpart to `wait_until_monitoring`. `generation` is
+/// the `run_generation` that was actually being monitored (the value
+/// from *before* the pause/stop transition, since that transition itself
+/// never changes `run_generation` — only entering `Running` does).
+pub fn wait_until_torn_down(root: &Path, generation: u64, timeout: Duration) -> bool {
+    const TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    let start = Instant::now();
+    loop {
+        if let Ok(Some(entry)) = registry::find(root) {
+            if entry.torn_down_generation == Some(generation) {
+                return true;
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(TEARDOWN_POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests here (rather than in `tests/watch_integration.rs`) exist
+    //! specifically to reach `Daemon`'s private fields directly, so a
+    //! candidate can be manufactured as "already ready" — or an event can
+    //! be manufactured as "observed under an old generation" — with zero
+    //! reliance on real elapsed time, `stability_seconds`, the poll
+    //! interval, or any sleep.
+    use super::*;
+    use crate::config::set_test_global_config_dir;
+    use crate::watch::registry::{add, clear_test_watch_dir, find, set_test_watch_dir, transition};
+
+    fn isolate() -> (tempfile::TempDir, tempfile::TempDir) {
+        let watch_dir = tempfile::tempdir().unwrap();
+        set_test_watch_dir(watch_dir.path().join(".sift-watch-test"));
+        let global_dir = tempfile::tempdir().unwrap();
+        set_test_global_config_dir(global_dir.path().to_path_buf());
+        (watch_dir, global_dir)
+    }
+
+    /// Forces the exact interleaving the readiness/authorization design
+    /// must survive: `reconcile()` runs while the registry still says
+    /// `Running`, installing a live monitor; *then*, with no further
+    /// `reconcile()` in between, some other actor (a concurrent `sift
+    /// watch pause`/`stop`, modeled here by calling `transition` directly
+    /// against the same on-disk registry) revokes that authorization;
+    /// *then* `process_ready()` runs against a candidate that is
+    /// unconditionally ready by construction (a zero-length stability
+    /// window plus one already-consumed baseline poll — never a real
+    /// elapsed duration). The only question this test answers is whether
+    /// `process_ready()` re-checks authorization for itself, since
+    /// nothing else in this sequence ever tells it the state changed.
+    #[test]
+    fn process_ready_refuses_to_mutate_once_registry_state_changed_after_reconcile() {
+        let (_watch_dir, _global_dir) = isolate();
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+
+        add(root.clone(), true, false).unwrap();
+        transition(&root, WatchState::Running).unwrap();
+
+        let mut daemon = Daemon::new().unwrap();
+        // `reconcile()` while the registry still says Running: installs
+        // the real monitor, the real `notify` watch, and records the
+        // generation it was built for — exactly what a real `tick()`
+        // would have done.
+        daemon.reconcile();
+        assert!(daemon.roots.contains_key(&root));
+        assert_eq!(find(&root).unwrap().unwrap().state, WatchState::Running);
+
+        // Force the stability window to zero so the *second* poll of an
+        // already-tracked candidate is unconditionally ready, regardless
+        // of how much (or how little) wall-clock time actually elapses
+        // between the two calls below — no `stability_seconds`, no sleep.
+        daemon.policy_cache.get_mut(&root).unwrap().resolved = Ok(EffectivePolicy {
+            stability: Duration::ZERO,
+            ..EffectivePolicy::default()
+        });
+
+        let file = root.join("invoice.pdf");
+        fs::write(&file, b"x").unwrap();
+        let now = Instant::now();
+        daemon
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .monitor
+            .observe_event(&file, now);
+        // First poll only ever establishes the baseline snapshot — never
+        // ready on its own, by construction of `StabilityTracker`.
+        assert!(daemon
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .monitor
+            .poll_ready(now, Duration::ZERO)
+            .is_empty());
+
+        // Some other actor revokes authorization for this exact
+        // generation — no `reconcile()` call happens in between, so
+        // `process_ready()` below is the *only* thing that can still
+        // catch this.
+        transition(&root, WatchState::Paused).unwrap();
+
+        // The candidate is unconditionally ready now (same tracked
+        // baseline, zero-length window): `process_ready()` runs with
+        // whatever authorization check it has — or doesn't have.
+        daemon.process_ready();
+
+        assert!(
+            file.exists(),
+            "process_ready() must never mutate the filesystem once the registry state \
+             changed away from Running, even with no intervening reconcile() to notice it"
+        );
+        assert!(!root.join("Images/invoice.pdf").exists());
+
+        clear_test_watch_dir();
+        crate::config::clear_test_global_config_dir();
+    }
+
+    /// Same shape, but the revocation is a generation bump with `state`
+    /// staying `Running` the whole time (the pause-immediately-resumed
+    /// case) — `process_ready()` must catch this from the generation
+    /// mismatch alone, since `state == Running` on its own says nothing
+    /// about which run it refers to.
+    #[test]
+    fn process_ready_refuses_to_mutate_once_run_generation_advanced_after_reconcile() {
+        let (_watch_dir, _global_dir) = isolate();
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+
+        add(root.clone(), true, false).unwrap();
+        transition(&root, WatchState::Running).unwrap();
+
+        let mut daemon = Daemon::new().unwrap();
+        daemon.reconcile();
+
+        daemon.policy_cache.get_mut(&root).unwrap().resolved = Ok(EffectivePolicy {
+            stability: Duration::ZERO,
+            ..EffectivePolicy::default()
+        });
+
+        let file = root.join("invoice.pdf");
+        fs::write(&file, b"x").unwrap();
+        let now = Instant::now();
+        daemon
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .monitor
+            .observe_event(&file, now);
+        assert!(daemon
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .monitor
+            .poll_ready(now, Duration::ZERO)
+            .is_empty());
+
+        // Pause then resume, both with no `reconcile()` call in between —
+        // `state` is `Running` again by the time `process_ready()` runs,
+        // but at a *newer* generation than the live monitor was built for.
+        transition(&root, WatchState::Paused).unwrap();
+        let resumed = transition(&root, WatchState::Running).unwrap();
+        assert_ne!(
+            Some(resumed.run_generation),
+            daemon.roots.get(&root).map(|w| w.generation),
+            "test precondition: the generation must actually have moved past what the \
+             live monitor was built for"
+        );
+
+        daemon.process_ready();
+
+        assert!(
+            file.exists(),
+            "process_ready() must never mutate the filesystem for a monitor generation \
+             that no longer matches the registry's current run_generation, even though \
+             state == Running throughout"
+        );
+        assert!(!root.join("Images/invoice.pdf").exists());
+
+        clear_test_watch_dir();
+        crate::config::clear_test_global_config_dir();
+    }
+
+    /// Proves the structural, notify-timing-independent fix for a late
+    /// event from an earlier, already-torn-down generation: manufactures
+    /// exactly that scenario by hand — a root currently watched at
+    /// generation 2, and an `ObservedEvent` tagged with generation 1 sent
+    /// directly into the daemon's channel (modeling a `notify` callback
+    /// from generation 1's now-dropped watcher, whose event only reaches
+    /// the channel *after* generation 2's watcher already exists). No
+    /// pause/resume timing, no real `notify` delivery delay, no sleep is
+    /// involved — the tag alone must decide this.
+    ///
+    /// The companion positive case — a legitimately new file whose *file
+    /// mtime* happens to predate the current generation (`cp -p`,
+    /// `rsync -a`, archive extraction) — is exercised end-to-end with a
+    /// real `notify::Watcher` in
+    /// `tests/watch_integration.rs::real_notify_preserved_old_mtime_current_generation_event_is_still_organized`,
+    /// proving the fix does *not* reject on file metadata the way an
+    /// earlier, incorrect version of this fix did.
+    #[test]
+    fn drain_events_discards_an_event_tagged_with_a_generation_older_than_the_root_is_currently_watched_at(
+    ) {
+        let (_watch_dir, _global_dir) = isolate();
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+
+        add(root.clone(), true, false).unwrap();
+        transition(&root, WatchState::Running).unwrap(); // generation 1
+        transition(&root, WatchState::Paused).unwrap();
+        let resumed = transition(&root, WatchState::Running).unwrap(); // generation 2
+
+        // Created *before* the generation-2 watcher is ever installed
+        // below, so no genuine `notify` event ever fires for it (the
+        // usual "no backfill" rule) — the only event this test will see
+        // for this path is the synthetic, hand-tagged one sent further
+        // down. Without this, the real generation-2 watcher would fire
+        // its own (correctly-tagged, legitimately trackable) event for
+        // this same file the moment it's created, confounding the
+        // assertion below with an event this test isn't trying to test.
+        let file = root.join("late-from-generation-1.jpg");
+        fs::write(&file, b"x").unwrap();
+
+        let mut daemon = Daemon::new().unwrap();
+        daemon.reconcile();
+        assert_eq!(
+            daemon.roots.get(&root).map(|w| w.generation),
+            Some(resumed.run_generation),
+            "test precondition: the live monitor must be at the *current* generation"
+        );
+
+        // Model a `notify` event that generation 1's (already-dropped)
+        // watcher produced, arriving only now — tagged with generation 1
+        // at the moment *that* watcher's closure was created, forever
+        // fixed, regardless of when it's actually drained.
+        let stale_generation = resumed.run_generation - 1;
+        daemon
+            .tx
+            .send(ObservedEvent {
+                path: file.clone(),
+                generation: stale_generation,
+            })
+            .unwrap();
+
+        daemon.drain_events(Duration::from_millis(200));
+
+        assert_eq!(
+            daemon.roots.get(&root).unwrap().monitor.pending_count(),
+            0,
+            "an event tagged with a generation older than the root's current one must \
+             never be tracked as a candidate at all"
+        );
+
+        clear_test_watch_dir();
+        crate::config::clear_test_global_config_dir();
+    }
 }

@@ -30,6 +30,17 @@ use std::time::Duration;
 
 const DAEMON_START_WAIT: Duration = Duration::from_secs(3);
 const DAEMON_STOP_WAIT: Duration = Duration::from_secs(5);
+/// Bounded wait, *after* the daemon process itself is confirmed running,
+/// for it to reconcile and actually install a `notify` watch for one
+/// specific root. Comfortably above one `daemon::POLL_INTERVAL` (400ms) —
+/// this is the fix for the start/resume readiness race, not a guess.
+const WATCH_READY_WAIT: Duration = Duration::from_secs(5);
+/// Bounded wait, symmetric with `WATCH_READY_WAIT`, for the daemon to
+/// confirm it actually tore down a root's live monitor after `watch
+/// pause`/`stop` — so "no longer being monitored" is an observed fact by
+/// the time either command reports success, not an assumption about the
+/// daemon's poll cadence.
+const WATCH_TEARDOWN_WAIT: Duration = Duration::from_secs(5);
 
 fn canonicalize_existing(path: &str) -> Result<PathBuf, String> {
     std::fs::canonicalize(path).map_err(|_| format!("{path}: no such directory"))
@@ -178,29 +189,117 @@ fn cmd_watch_transition(path: String, to: WatchState, verb: &str) -> bool {
             return false;
         }
     }
-    match registry::transition(&canonical, to) {
-        Ok(entry) => {
+    // Only meaningful for `to == Running`: what to restore the entry to
+    // if readiness can't be confirmed below (Stopped for `start`, Paused
+    // for `resume`). Captured *before* the transition, since
+    // `registry::transition` immediately overwrites `state` with `to`.
+    let previous_state = match registry::find(&canonical) {
+        Ok(Some(e)) => e.state,
+        _ => WatchState::Stopped,
+    };
+    let entry = match registry::transition(&canonical, to) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{e}");
+            return false;
+        }
+    };
+
+    if to != WatchState::Running {
+        // No live daemon at all means there is nothing left to tear
+        // down — the registry update above is already the whole truth,
+        // and waiting for an acknowledgment nothing will ever send would
+        // just burn the full timeout for no reason.
+        if matches!(daemon::daemon_status(), daemon::DaemonStatus::NotRunning) {
             println!(
                 "{}: {} is now {}",
                 verb,
                 entry.path.display(),
                 entry.state.label()
             );
-            if to == WatchState::Running {
-                if let Err(e) = daemon::ensure_running(DAEMON_START_WAIT) {
-                    eprintln!("warning: watch state updated, but the daemon is not confirmed running: {e}");
-                    eprintln!("Check with `sift watch daemon status`.");
-                }
-                // Best-effort only: never affects this command's outcome
-                // or output either way (see `tray` module docs).
-                tray::ensure_running_best_effort();
-            }
+            return true;
+        }
+        // Do not announce success until the daemon has actually
+        // unregistered its `notify` watch and discarded any pending
+        // candidates for this exact run — otherwise "paused"/"stopped"
+        // would mean nothing more than "the registry file says so",
+        // which is exactly the readiness gap already closed for
+        // start/resume, mirrored here for the teardown direction.
+        return if daemon::wait_until_torn_down(
+            &canonical,
+            entry.run_generation,
+            WATCH_TEARDOWN_WAIT,
+        ) {
+            println!(
+                "{}: {} is now {}",
+                verb,
+                entry.path.display(),
+                entry.state.label()
+            );
             true
-        }
-        Err(e) => {
-            eprintln!("{e}");
+        } else {
+            eprintln!(
+                "warning: {} is recorded as {} but the daemon has not confirmed it stopped \
+                 monitoring within {:?}.",
+                canonical.display(),
+                entry.state.label(),
+                WATCH_TEARDOWN_WAIT
+            );
+            eprintln!(
+                "It may still process an already in-flight filesystem event. \
+                 Check `sift watch daemon status` and the daemon log."
+            );
             false
-        }
+        };
+    }
+
+    if let Err(e) = daemon::ensure_running(DAEMON_START_WAIT) {
+        eprintln!("error: could not confirm the watch daemon is running: {e}");
+        eprintln!("Check with `sift watch daemon status`.");
+        revert_after_unconfirmed_start(&canonical, previous_state);
+        return false;
+    }
+    // Best-effort only: never affects this command's outcome or output
+    // either way (see `tray` module docs).
+    tray::ensure_running_best_effort();
+
+    // Do not announce success until the daemon has actually installed a
+    // `notify` watch for this exact root, at this exact `run_generation`
+    // — otherwise a file created the instant this command returns could
+    // race an as-yet-uninstalled watcher and, since Watch never backfills
+    // pre-existing files, be missed forever.
+    if daemon::wait_until_monitoring(&canonical, entry.run_generation, WATCH_READY_WAIT) {
+        println!(
+            "{}: {} is now {}",
+            verb,
+            entry.path.display(),
+            entry.state.label()
+        );
+        true
+    } else {
+        eprintln!(
+            "error: {} was not confirmed as actively monitored within {:?}.",
+            canonical.display(),
+            WATCH_READY_WAIT
+        );
+        eprintln!("Check `sift watch daemon status` and the daemon log, then retry.");
+        revert_after_unconfirmed_start(&canonical, previous_state);
+        false
+    }
+}
+
+/// Restores the pre-transition state after a start/resume whose readiness
+/// could not be confirmed, so a failed command never leaves the registry
+/// claiming `running` while nothing is actually watching. Best-effort by
+/// necessity (there is no more-authoritative fallback) — the loud error
+/// already printed above is what tells the user not to trust the state if
+/// even this fails.
+fn revert_after_unconfirmed_start(canonical: &Path, previous_state: WatchState) {
+    if let Err(e) = registry::transition(canonical, previous_state) {
+        eprintln!(
+            "warning: could not restore previous state ({}): {e}",
+            previous_state.label()
+        );
     }
 }
 

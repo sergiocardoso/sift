@@ -7,13 +7,17 @@
 
 use sift::config::EffectivePolicy;
 use sift::domain::{HistoryItem, Op};
+use sift::watch::daemon;
 use sift::watch::daemon::Daemon;
 use sift::watch::engine::{process_candidate, RootMonitor};
 use sift::watch::registry::{
     self, add, clear_test_watch_dir, find, list, remove, set_recursive, set_test_watch_dir,
     transition, validate_root, WatchState,
 };
-use sift::watch::{cmd_watch_add, cmd_watch_list, cmd_watch_set_recursive};
+use sift::watch::{
+    cmd_watch_add, cmd_watch_list, cmd_watch_pause, cmd_watch_resume, cmd_watch_set_recursive,
+    cmd_watch_start,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -167,6 +171,51 @@ fn registry_persists_across_separate_calls() {
         let all = list().unwrap();
         assert_eq!(all.len(), 1);
         assert!(all[0].recursive);
+    });
+}
+
+#[test]
+fn registry_deserializes_pre_readiness_format_missing_generation_fields() {
+    // A registry.json written by a Sift version before `run_generation`/
+    // `monitoring_generation` existed. Old installs must upgrade in
+    // place without losing (or failing to load) their existing watches.
+    with_isolated_registry(|_root| {
+        let old_format = r#"{
+  "watches": [
+    {
+      "path": "/tmp/old-watch",
+      "state": "running",
+      "auto_apply": true,
+      "recursive": false,
+      "created_at": 1700000000,
+      "updated_at": 1700000000
+    }
+  ]
+}"#;
+        let registry_path = registry::watch_dir().join("registry.json");
+        fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        fs::write(&registry_path, old_format).unwrap();
+
+        let all = list().unwrap();
+        assert_eq!(all.len(), 1, "an old-format entry must still load");
+        let entry = &all[0];
+        assert_eq!(entry.path, PathBuf::from("/tmp/old-watch"));
+        assert_eq!(entry.state, WatchState::Running);
+        assert_eq!(
+            entry.run_generation, 0,
+            "a missing run_generation must default to 0, not fail to parse"
+        );
+        assert_eq!(
+            entry.monitoring_generation, None,
+            "a missing monitoring_generation must default to None, not fail to parse"
+        );
+
+        // And the registry must still be writable afterward — loading an
+        // old entry must not corrupt the file or wedge future writes.
+        let found = find(&PathBuf::from("/tmp/old-watch")).unwrap().unwrap();
+        assert_eq!(found.run_generation, 0);
+        let promoted = transition(&PathBuf::from("/tmp/old-watch"), WatchState::Paused).unwrap();
+        assert_eq!(promoted.state, WatchState::Paused);
     });
 }
 
@@ -936,6 +985,330 @@ fn watch_blocked_collision_is_not_recorded_and_not_undoable() {
 }
 
 // ============================================================
+// Start/resume readiness (the daemon-monitoring race)
+//
+// These drive `cmd_watch_start`/`cmd_watch_resume` themselves — the real
+// production entry points, including `daemon::ensure_running` and the new
+// `daemon::wait_until_monitoring` — against a real `Daemon` (real
+// `notify` watcher, real singleton OS lock) run on a background thread
+// via `daemon::run()` instead of a spawned OS process, so no actual
+// `sift` binary needs to be reachable from the test process. Because the
+// test overrides (`set_test_watch_dir` etc.) are thread-local, the
+// spawned thread re-applies them for itself before calling `daemon::run`
+// — everything still goes through the same on-disk registry/lock files,
+// which is the only channel the real CLI-process/daemon-process split
+// uses anyway.
+// ============================================================
+
+/// Owns a background thread running the real `daemon::run()` loop, for
+/// exactly one test's isolated watch dir. `spawn` does not return until
+/// the thread has actually acquired the singleton daemon lock, so a test
+/// calling `cmd_watch_start` right after never races `ensure_running`
+/// into trying to spawn a *real* second daemon process.
+struct TestDaemon {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TestDaemon {
+    fn spawn(watch_dir: PathBuf, global_config_dir: PathBuf, history_dir: PathBuf) -> Self {
+        let handle = std::thread::spawn(move || {
+            set_test_watch_dir(watch_dir);
+            sift::config::set_test_global_config_dir(global_config_dir);
+            sift::history::set_test_history_dir(history_dir);
+            let _ = daemon::run();
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if matches!(
+                daemon::daemon_status(),
+                daemon::DaemonStatus::Running { .. }
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(
+                daemon::daemon_status(),
+                daemon::DaemonStatus::Running { .. }
+            ),
+            "test daemon thread did not acquire the singleton lock in time"
+        );
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) {
+        let _ = daemon::request_stop_and_wait(Duration::from_secs(5));
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = daemon::request_stop_and_wait(Duration::from_secs(5));
+            let _ = h.join();
+        }
+    }
+}
+
+/// Waits (bounded) for `path` to exist. Used only to observe the eventual
+/// effect of a background daemon organizing a file — never to paper over
+/// the readiness race itself, which is proven by there being no delay
+/// between the triggering `cmd_watch_start`/`cmd_watch_resume` call
+/// returning and the file being created.
+fn wait_for(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    path.exists()
+}
+
+#[test]
+fn cli_watch_start_is_not_racy_a_file_created_immediately_after_return_is_organized() {
+    let d = tempdir().unwrap();
+    let watch_dir = d.path().join(".sift-watch-test");
+    let global_dir = d.path().join(".sift-global-config-test");
+    fs::create_dir_all(&global_dir).unwrap();
+    let root = d.path().join("Inbox");
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let history_dir = root.join(".sift-history-test");
+
+    set_test_watch_dir(watch_dir.clone());
+    sift::config::set_test_global_config_dir(global_dir.clone());
+    sift::history::set_test_history_dir(history_dir.clone());
+
+    let test_daemon = TestDaemon::spawn(watch_dir.clone(), global_dir.clone(), history_dir.clone());
+
+    assert!(cmd_watch_add(
+        root.to_string_lossy().to_string(),
+        true,
+        false
+    ));
+
+    assert!(
+        cmd_watch_start(root.to_string_lossy().to_string()),
+        "start must succeed once the daemon confirms it is actually monitoring the root"
+    );
+
+    // The invariant under test: no delay here at all. If this file's
+    // create event could still race an as-yet-uninstalled `notify`
+    // watcher, it would never be organized (Watch never backfills).
+    let photo = root.join("photo.jpg");
+    fs::write(&photo, b"x").unwrap();
+
+    assert!(
+        wait_for(&root.join("Images/photo.jpg"), Duration::from_secs(10)),
+        "a file created immediately after a successful `watch start` must be organized"
+    );
+
+    test_daemon.stop();
+    clear_test_watch_dir();
+    sift::config::clear_test_global_config_dir();
+    sift::history::clear_test_history_dir();
+}
+
+#[test]
+fn cli_watch_resume_is_not_racy_and_still_never_backfills() {
+    let d = tempdir().unwrap();
+    let watch_dir = d.path().join(".sift-watch-test");
+    let global_dir = d.path().join(".sift-global-config-test");
+    fs::create_dir_all(&global_dir).unwrap();
+    let root = d.path().join("Inbox");
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let history_dir = root.join(".sift-history-test");
+    // Present before the watch is ever started — per the "no backfill"
+    // rule, this must never be organized, including across a later
+    // pause/resume cycle.
+    let preexisting = root.join("preexisting.jpg");
+    fs::write(&preexisting, b"x").unwrap();
+
+    set_test_watch_dir(watch_dir.clone());
+    sift::config::set_test_global_config_dir(global_dir.clone());
+    sift::history::set_test_history_dir(history_dir.clone());
+
+    let test_daemon = TestDaemon::spawn(watch_dir.clone(), global_dir.clone(), history_dir.clone());
+
+    assert!(cmd_watch_add(
+        root.to_string_lossy().to_string(),
+        true,
+        false
+    ));
+    assert!(cmd_watch_start(root.to_string_lossy().to_string()));
+    assert!(cmd_watch_pause(root.to_string_lossy().to_string()));
+    assert!(
+        cmd_watch_resume(root.to_string_lossy().to_string()),
+        "resume must succeed once the daemon confirms it is actually monitoring the root again"
+    );
+
+    // The invariant under test: no delay here at all.
+    let after_resume = root.join("after-resume.jpg");
+    fs::write(&after_resume, b"y").unwrap();
+
+    assert!(
+        wait_for(
+            &root.join("Images/after-resume.jpg"),
+            Duration::from_secs(10)
+        ),
+        "a file created immediately after a successful `watch resume` must be organized"
+    );
+    assert!(
+        preexisting.exists(),
+        "a file that predates `watch start` must never be backfilled, even across a \
+         later pause/resume cycle"
+    );
+    assert!(!root.join("Images/preexisting.jpg").exists());
+
+    test_daemon.stop();
+    clear_test_watch_dir();
+    sift::config::clear_test_global_config_dir();
+    sift::history::clear_test_history_dir();
+}
+
+#[test]
+fn cli_watch_start_times_out_and_reverts_to_stopped_when_daemon_never_confirms_readiness() {
+    with_isolated_registry(|root| {
+        let inbox = root.join("Inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let inbox = inbox.canonicalize().unwrap();
+        add(inbox.clone(), true, false).unwrap();
+
+        // Simulate a daemon *process* that is alive (holds the singleton
+        // lock, so `ensure_running` never tries to spawn a second one)
+        // but stuck — it never reconciles, so this root can never
+        // actually become monitored. `watch start` must not be fooled by
+        // the process merely being alive.
+        let lock_path = registry::daemon_lock_path();
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.lock().unwrap();
+
+        let ok = cmd_watch_start(inbox.to_string_lossy().to_string());
+        assert!(
+            !ok,
+            "start must fail rather than report success when readiness can't be confirmed"
+        );
+
+        let entry = find(&inbox).unwrap().unwrap();
+        assert_eq!(
+            entry.state,
+            WatchState::Stopped,
+            "a failed start must revert to the previous (stopped) state, never leave the \
+             registry claiming running while nothing is actually watching"
+        );
+
+        lock_file.unlock().unwrap();
+    });
+}
+
+#[test]
+fn cli_watch_pause_does_not_return_until_the_daemon_confirms_teardown() {
+    let d = tempdir().unwrap();
+    let watch_dir = d.path().join(".sift-watch-test");
+    let global_dir = d.path().join(".sift-global-config-test");
+    fs::create_dir_all(&global_dir).unwrap();
+    let root = d.path().join("Inbox");
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let history_dir = root.join(".sift-history-test");
+
+    set_test_watch_dir(watch_dir.clone());
+    sift::config::set_test_global_config_dir(global_dir.clone());
+    sift::history::set_test_history_dir(history_dir.clone());
+
+    let test_daemon = TestDaemon::spawn(watch_dir.clone(), global_dir.clone(), history_dir.clone());
+
+    assert!(cmd_watch_add(
+        root.to_string_lossy().to_string(),
+        true,
+        false
+    ));
+    assert!(cmd_watch_start(root.to_string_lossy().to_string()));
+    let running_generation = find(&root).unwrap().unwrap().run_generation;
+
+    assert!(
+        cmd_watch_pause(root.to_string_lossy().to_string()),
+        "pause must succeed once the daemon confirms it actually tore the monitor down"
+    );
+
+    // The contract under test: by the moment `cmd_watch_pause` returns,
+    // the daemon has *already* acknowledged tearing down this exact
+    // generation's monitor — not merely that the registry file says
+    // "paused".
+    let paused = find(&root).unwrap().unwrap();
+    assert_eq!(paused.state, WatchState::Paused);
+    assert_eq!(
+        paused.torn_down_generation,
+        Some(running_generation),
+        "cmd_watch_pause must not return success before the daemon has acknowledged \
+         tearing down this exact run_generation"
+    );
+
+    test_daemon.stop();
+    clear_test_watch_dir();
+    sift::config::clear_test_global_config_dir();
+    sift::history::clear_test_history_dir();
+}
+
+#[test]
+fn cli_watch_pause_times_out_but_leaves_the_requested_state_when_daemon_never_confirms_teardown() {
+    with_isolated_registry(|root| {
+        let inbox = root.join("Inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let inbox = inbox.canonicalize().unwrap();
+        add(inbox.clone(), true, false).unwrap();
+        transition(&inbox, WatchState::Running).unwrap();
+
+        // Simulate a daemon *process* that is alive (holds the singleton
+        // lock, so `cmd_watch_pause` doesn't take the "no daemon at all"
+        // shortcut) but stuck — it never reconciles, so it can never
+        // acknowledge tearing this root's monitor down.
+        let lock_path = registry::daemon_lock_path();
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.lock().unwrap();
+
+        let ok = cmd_watch_pause(inbox.to_string_lossy().to_string());
+        assert!(
+            !ok,
+            "pause must fail rather than report success when teardown can't be confirmed"
+        );
+
+        let entry = find(&inbox).unwrap().unwrap();
+        assert_eq!(
+            entry.state,
+            WatchState::Paused,
+            "the requested state is still honored even though the daemon hasn't caught up \
+             yet — unlike start/resume, there is no safer state to revert pause/stop to"
+        );
+
+        lock_file.unlock().unwrap();
+    });
+}
+
+// ============================================================
 // CLI parsing
 // ============================================================
 
@@ -1131,6 +1504,61 @@ fn real_notify_organizes_a_new_file_end_to_end() {
 }
 
 #[test]
+fn real_notify_preserved_old_mtime_current_generation_event_is_still_organized() {
+    // A file copied into a watched folder with `cp -p`, synced with
+    // `rsync -a`, extracted from an archive, or restored from a backup
+    // can legitimately carry an mtime from long before this watch's
+    // current generation even started. That is a completely ordinary,
+    // legitimate *current-generation* filesystem event — an old mtime is
+    // never, on its own, evidence that the underlying `notify` event is
+    // a stale leftover from an earlier, already-torn-down generation.
+    let d = tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+
+    with_isolated_registry(|_reg_root| {
+        add(root.clone(), true, false).unwrap();
+        transition(&root, WatchState::Running).unwrap();
+
+        with_isolated_history(&root, || {
+            let mut daemon = Daemon::new().unwrap();
+            daemon.reconcile();
+
+            let file = root.join("invoice.pdf");
+            fs::write(&file, b"x").unwrap();
+            // Simulate `cp -p`/`rsync -a`/archive extraction: brand new
+            // to this directory, but an old preserved mtime (~1 year).
+            let old_mtime = std::time::SystemTime::now() - Duration::from_secs(365 * 24 * 3600);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(old_mtime)
+                .unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut done = false;
+            while Instant::now() < deadline {
+                daemon.reconcile();
+                daemon.drain_events(Duration::from_millis(100));
+                daemon.process_ready();
+                if root.join("Documents/invoice.pdf").exists() {
+                    done = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            assert!(
+                done,
+                "a legitimately new file whose mtime happens to predate this watch's \
+                 current generation must still be organized — an old mtime alone is not \
+                 evidence of a stale/leftover event"
+            );
+        });
+    });
+}
+
+#[test]
 fn real_notify_recursive_watch_uses_nested_local_sift_toml() {
     // The core scenario this test guards: a recursive watch rooted at
     // `root` must let `root/client/`'s own local `.sift.toml` govern files
@@ -1199,6 +1627,138 @@ fn real_notify_recursive_watch_uses_nested_local_sift_toml() {
                 "client/'s own unknown=skip policy must keep this file in place"
             );
             assert!(!root.join("client/Other/weird.xyzabc").exists());
+        });
+    });
+}
+
+#[test]
+fn real_notify_pause_then_resume_invisible_to_reconcile_never_organizes_the_pause_window_file() {
+    // The scenario: pause immediately followed by resume, both landing
+    // strictly between two of the daemon's reconcile ticks, so
+    // `reconcile` never once observes the intermediate `Paused` state —
+    // `running` looks unbroken across the gap, only `run_generation`
+    // moved. A file created during that invisible pause must still never
+    // be organized, even though the real OS `notify` watch may never
+    // technically have gone down, and even though its create event may
+    // already be sitting in the daemon's event channel by the time the
+    // resume's `reconcile` runs.
+    let d = tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+
+    with_isolated_registry(|_reg_root| {
+        add(root.clone(), true, false).unwrap();
+        transition(&root, WatchState::Running).unwrap();
+
+        with_isolated_history(&root, || {
+            let mut daemon = Daemon::new().unwrap();
+            daemon.tick(Duration::from_millis(100));
+            assert!(daemon.is_monitoring(&root));
+
+            // Pause and resume back-to-back, with no `daemon.tick()`
+            // call in between — this *is* "invisible to reconcile".
+            transition(&root, WatchState::Paused).unwrap();
+            let during_pause = root.join("during-pause.jpg");
+            fs::write(&during_pause, b"x").unwrap();
+            // Bounded wait purely for the real kernel to deliver the
+            // create event into notify's channel before resuming — this
+            // is what makes the test actually exercise "an event queued
+            // while the OS watcher still exists", not a guess about
+            // whether it does. Not a wait for any daemon-side state.
+            std::thread::sleep(Duration::from_millis(300));
+            transition(&root, WatchState::Running).unwrap();
+
+            // Drive real ticks for a bounded time — long enough that,
+            // absent a fix, the default 2.5s stability window would have
+            // elapsed several times over and the file would have been
+            // organized.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                daemon.tick(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            assert!(
+                during_pause.exists(),
+                "a file created during a pause/resume round-trip invisible to the daemon's \
+                 poll loop must never be organized"
+            );
+            assert!(!root.join("Images/during-pause.jpg").exists());
+
+            // The pipeline itself must still be alive after the resume:
+            // a genuinely new file must be organized normally.
+            let after_resume = root.join("after-resume.jpg");
+            fs::write(&after_resume, b"y").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut organized = false;
+            while Instant::now() < deadline {
+                daemon.tick(Duration::from_millis(100));
+                if root.join("Images/after-resume.jpg").exists() {
+                    organized = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                organized,
+                "a file created after the resume must still be organized normally"
+            );
+        });
+    });
+}
+
+#[test]
+fn real_notify_reverted_start_never_organizes_an_event_from_the_failed_generation() {
+    // Simulates the readiness-timeout rollback path in
+    // `cmd_watch_transition`/`revert_after_unconfirmed_start`: the CLI
+    // has already reverted the registry to `Stopped` and returned
+    // failure, but the daemon — which never got a chance to reconcile
+    // that revert yet — still has a live monitor (and a live OS `notify`
+    // watch) from the generation that just failed. A file created in
+    // that exact window must never be organized once the daemon finally
+    // catches up.
+    let d = tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+
+    with_isolated_registry(|_reg_root| {
+        add(root.clone(), true, false).unwrap();
+        transition(&root, WatchState::Running).unwrap();
+
+        with_isolated_history(&root, || {
+            let mut daemon = Daemon::new().unwrap();
+            // The daemon has genuinely installed a live monitor + real
+            // OS watch for the "failed" generation, exactly as it would
+            // have by the time a real `watch start` gives up waiting.
+            daemon.tick(Duration::from_millis(100));
+            assert!(daemon.is_monitoring(&root));
+
+            // The CLI's rollback: reverts the registry directly, with no
+            // daemon tick in between — the daemon has no way to know yet.
+            transition(&root, WatchState::Stopped).unwrap();
+
+            let after_revert = root.join("should-never-organize.jpg");
+            fs::write(&after_revert, b"x").unwrap();
+            // Bounded wait purely for the kernel to deliver the create
+            // event into notify's channel while the OS watch is still
+            // live (the daemon hasn't reconciled the revert yet).
+            std::thread::sleep(Duration::from_millis(300));
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                daemon.tick(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            assert!(
+                after_revert.exists(),
+                "a file created after a failed start's rollback must never be organized, \
+                 even though the daemon's live monitor from that generation was still up \
+                 at the moment the file was created"
+            );
+            assert!(!root.join("Images/should-never-organize.jpg").exists());
+            assert!(
+                !daemon.is_monitoring(&root),
+                "the daemon must have torn the monitor down once it reconciled the revert"
+            );
         });
     });
 }
