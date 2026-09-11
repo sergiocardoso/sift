@@ -30,6 +30,7 @@ EXAMPLES:
                                Register a folder for automatic organization
     sift watch start ~/Inbox   Start watching (does not touch pre-existing files)
     sift watch list            Show every registered watch and its state
+    sift watch tray            Launch the optional sift-tray GUI app
 
   Whole-folder moves:
     sift folders .             Preview which whole subfolders would move into Documents/Images/...
@@ -289,6 +290,11 @@ pub enum WatchCommands {
         #[command(subcommand)]
         action: DaemonCommands,
     },
+    /// Launch the optional sift-tray GUI app directly (no-op if it's
+    /// already running). `watch start`/`resume` already try this
+    /// silently on their own — this is for launching it on its own,
+    /// without starting or resuming a watch.
+    Tray,
 }
 
 #[derive(Subcommand)]
@@ -426,5 +432,6 @@ fn dispatch_watch(action: WatchCommands) -> std::process::ExitCode {
             DaemonCommands::Stop => exit_code(crate::watch::cmd_watch_daemon_stop()),
             DaemonCommands::Run => exit_code(crate::watch::cmd_watch_daemon_run()),
         },
+        WatchCommands::Tray => exit_code(crate::watch::cmd_watch_tray()),
     }
 }

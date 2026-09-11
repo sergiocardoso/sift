@@ -1,6 +1,6 @@
 [package]
 name = "sift-tray"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 authors = ["Sérgio Cardoso"]
 description = "Optional system tray / menu bar UI listing sift's watched folders."

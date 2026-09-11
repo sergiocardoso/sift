@@ -481,6 +481,40 @@ pub fn cmd_watch_daemon_stop() -> bool {
     }
 }
 
+/// `sift watch tray`: explicitly launches the optional `sift-tray` GUI
+/// app. Unlike `tray::ensure_running_best_effort` (silent, best-effort,
+/// invoked as a side effect of `start`/`resume`), this reports exactly
+/// what happened.
+pub fn cmd_watch_tray() -> bool {
+    match tray::launch() {
+        tray::LaunchOutcome::AlreadyRunning => {
+            println!("sift-tray is already running.");
+            true
+        }
+        tray::LaunchOutcome::Started => {
+            println!("Started sift-tray.");
+            true
+        }
+        tray::LaunchOutcome::NotInstalled => {
+            eprintln!(
+                "sift-tray is not installed. Download it from a GitHub Release, or build \
+                 it with `cargo build -p sift-tray --release`, and put it next to `sift` \
+                 or somewhere on your PATH — see the README's \"Optional sift-tray\" \
+                 section."
+            );
+            false
+        }
+        tray::LaunchOutcome::FailedToStart => {
+            eprintln!(
+                "sift-tray was launched but never reported itself as running — check {} \
+                 for details.",
+                registry::tray_log_path().display()
+            );
+            false
+        }
+    }
+}
+
 /// `sift watch daemon run`: the internal foreground entry point for the
 /// background worker process itself (normally launched detached via
 /// `watch start`, never meant to be run directly by a user in a terminal

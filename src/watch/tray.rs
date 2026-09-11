@@ -1,12 +1,17 @@
-//! Best-effort auto-launch of the optional `sift-tray` GUI app whenever a
-//! watch starts running from the `sift` CLI itself.
+//! Launching the optional `sift-tray` GUI app from the `sift` CLI itself,
+//! two ways:
+//!   - [`ensure_running_best_effort`]: silent, best-effort, invoked as a
+//!     side effect of `watch start`/`resume`. Failure is never surfaced —
+//!     `sift watch start`/`resume` must never fail, warn, or block on
+//!     whether a tray icon could be shown.
+//!   - [`launch`]: explicit, for `sift watch tray`. Same underlying
+//!     mechanics, but reports exactly what happened (already running,
+//!     not installed, started, or spawned yet never came up) instead of
+//!     swallowing every outcome.
 //!
 //! `sift-tray` is deliberately a separate binary (see its own crate docs)
 //! so the CLI never pulls in GUI dependencies, and most installs don't
-//! even ship it (`install.sh` only installs `sift`). So every step here
-//! is "if present, if it works" — failure is always silent to the
-//! caller: `sift watch start`/`resume` must never fail, warn, or block on
-//! whether a tray icon could be shown.
+//! even ship it (`install.sh` only installs `sift`).
 //!
 //! Singleton detection mirrors `daemon::daemon_status`: an OS file lock at
 //! `registry::tray_lock_path()`, held by `sift-tray` for its entire run
@@ -15,6 +20,31 @@
 use super::registry;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+/// Bounded wait, after spawning, for `sift-tray` to acquire its singleton
+/// lock (the very first thing its `main` does) before giving up and
+/// reporting [`LaunchOutcome::FailedToStart`] — a spawn can succeed while
+/// the process itself exits almost immediately (no display server,
+/// missing shared library, ...).
+const LAUNCH_CONFIRM_WAIT: Duration = Duration::from_secs(2);
+
+/// Outcome of an explicit [`launch`] call.
+pub enum LaunchOutcome {
+    /// A `sift-tray` instance already holds the singleton lock; nothing
+    /// was spawned.
+    AlreadyRunning,
+    /// No `sift-tray` binary found next to the current executable or on
+    /// `PATH`.
+    NotInstalled,
+    /// Spawned, and confirmed to have acquired the singleton lock within
+    /// [`LAUNCH_CONFIRM_WAIT`].
+    Started,
+    /// Spawned, but never showed up as running within
+    /// [`LAUNCH_CONFIRM_WAIT`] — see `registry::tray_log_path()` for its
+    /// stdout/stderr.
+    FailedToStart,
+}
 
 fn open_lock_file() -> Result<fs::File, String> {
     fs::create_dir_all(registry::watch_dir()).map_err(|e| format!("{e}"))?;
@@ -121,4 +151,28 @@ pub fn ensure_running_best_effort() {
     if let Some(exe) = find_tray_binary() {
         spawn_detached(exe);
     }
+}
+
+/// Explicit launch for `sift watch tray`: unlike
+/// [`ensure_running_best_effort`], this always attempts the launch (no
+/// `called_from_cli_binary` guard — a user typing this command is the
+/// authorization) and reports exactly what happened instead of ignoring
+/// every failure mode.
+pub fn launch() -> LaunchOutcome {
+    if is_running() {
+        return LaunchOutcome::AlreadyRunning;
+    }
+    let Some(exe) = find_tray_binary() else {
+        return LaunchOutcome::NotInstalled;
+    };
+    spawn_detached(exe);
+
+    let deadline = Instant::now() + LAUNCH_CONFIRM_WAIT;
+    while Instant::now() < deadline {
+        if is_running() {
+            return LaunchOutcome::Started;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    LaunchOutcome::FailedToStart
 }

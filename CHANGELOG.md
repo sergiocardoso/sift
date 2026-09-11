@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.5] - 2026-09-11
+- New `sift watch tray` command: explicitly launches the optional `sift-tray` GUI app, reporting exactly what happened (already running, started, not installed, or spawned but never came up) — unlike `watch start`/`resume`'s existing silent, best-effort auto-launch.
+
 ## [v0.7.4] - 2026-09-11
 - `sift-tray`'s About dialog now shows the full Sift wordmark (mark + wordtype) instead of just the mark, and credits the project to Sérgio Cardoso (www.sergiocardoso.dev) via the About dialog's copyright field.
 

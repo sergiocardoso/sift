@@ -786,6 +786,14 @@ This is silent and best-effort:
 - headless environments do not fail because there is no display;
 - only one tray instance runs at a time.
 
+To launch it on its own, without starting or resuming a watch:
+
+```bash
+sift watch tray
+```
+
+Unlike the auto-launch above, this reports exactly what happened — already running, started, not installed, or spawned but never came up.
+
 ---
 
 # Installation
