@@ -1,6 +1,6 @@
 <p align="center">
   <img
-    src="https://supabase.flokin.com.br/storage/v1/object/public/projects/sift/fc782592-f8e8-40e3-a14c-953971f25711.png"
+    src="image/logo.png"
     alt="Sift"
     width="520"
   />
@@ -58,12 +58,9 @@ no --apply
 → no filesystem mutation
 ```
 
-<!--
-Optional hero image:
 <p align="center">
-  <img src="docs/assets/sift-hero.png" alt="Sift overview" width="100%">
+  <img src="image/hero.png" alt="Sift overview" width="100%">
 </p>
--->
 
 ## Why Sift?
 
@@ -159,12 +156,9 @@ sift undo hist-...
 ✓ 7 items restored
 ```
 
-<!--
-Optional artwork:
 <p align="center">
-  <img src="docs/assets/sift-dry-run-undo.png" alt="Sift dry-run, apply and undo" width="100%">
+  <img src="image/dry-run-undo.png" alt="Sift dry-run, apply and undo" width="100%">
 </p>
--->
 
 ---
 
@@ -485,12 +479,9 @@ Inspect a specific decision:
 sift explain ~/Downloads/archive.zip
 ```
 
-<!--
-Optional artwork:
 <p align="center">
-  <img src="docs/assets/sift-rules.png" alt="Different folders, different Sift rules" width="100%">
+  <img src="image/rules.png" alt="Different folders, different Sift rules" width="100%">
 </p>
--->
 
 ## Rule actions
 
@@ -748,12 +739,9 @@ It lists watched folders and lets you:
 
 The tray app is intentionally thin: it uses the same Sift library and Watch registry rather than implementing a second organization engine.
 
-<!--
-Optional artwork:
 <p align="center">
-  <img src="docs/assets/sift-tray.png" alt="Sift tray application" width="100%">
+  <img src="image/tray.png" alt="Sift tray application" width="100%">
 </p>
--->
 
 ### Tray authorization behavior
 
