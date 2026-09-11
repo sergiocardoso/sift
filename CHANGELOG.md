@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.4] - 2026-09-11
+- `sift-tray`'s About dialog now shows the full Sift wordmark (mark + wordtype) instead of just the mark, and credits the project to Sérgio Cardoso (www.sergiocardoso.dev) via the About dialog's copyright field.
+
 ## [v0.7.3] - 2026-09-11
 - The update-availability notice now includes the actual runnable install command (`curl -fsSL https://raw.githubusercontent.com/sergiocardoso/sift/main/install.sh | sh`) instead of telling you to "run `./install.sh` again", which assumed the script was already present in your current directory.
 

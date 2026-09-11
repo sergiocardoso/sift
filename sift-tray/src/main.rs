@@ -325,11 +325,17 @@ fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
 /// "Sift, version x.y.z" and a short description for the native About
 /// dialog, using `sift::VERSION` (the actual `sift` package version, not
 /// this UI's own) so it can never drift out of sync.
+///
+/// Author attribution goes in `copyright` rather than `authors` or
+/// `comments`: those two are unsupported on macOS's About panel (see
+/// `muda::AboutMetadata`'s own field docs), while `copyright` renders
+/// verbatim on all three platforms this app ships for.
 fn about_metadata() -> AboutMetadata {
     AboutMetadata {
         name: Some("Sift".to_string()),
         version: Some(sift::VERSION.to_string()),
         comments: Some("Local-first, safe CLI for organizing files.".to_string()),
+        copyright: Some("A project by Sérgio Cardoso — www.sergiocardoso.dev".to_string()),
         website: Some("https://github.com/sergiocardoso/sift".to_string()),
         website_label: Some("GitHub".to_string()),
         icon: Some(about_dialog_icon()),
@@ -356,13 +362,15 @@ fn open_in_file_manager(path: &Path) {
     }
 }
 
-/// The real Sift logo, pre-sized and embedded at compile time (via
-/// `include_bytes!` — no network fetch, no external asset lookup at
-/// runtime) from `assets/`. Two sizes: a small one for the tray icon
-/// itself, a larger one for the About dialog (which displays it bigger).
-/// Both were downsized from the master artwork with ImageMagick once,
-/// ahead of time, rather than shipping the full-resolution PNG and
-/// resizing it in-process on every launch.
+/// Sift's branding, embedded at compile time (via `include_bytes!` — no
+/// network fetch, no external asset lookup at runtime) from `assets/`:
+/// the folder-and-sparkle mark alone for the tray icon (square, since
+/// that's what a tray icon slot needs), and the wordmark (mark + "Sift"
+/// wordtype) for the About dialog, which has room to show the full
+/// brand. Both were pre-processed (trimmed, backgrounds made
+/// transparent, downsized) once ahead of time rather than shipping
+/// full-resolution source art and resizing it in-process on every
+/// launch.
 const TRAY_ICON_PNG: &[u8] = include_bytes!("../assets/icon-tray.png");
 const ABOUT_ICON_PNG: &[u8] = include_bytes!("../assets/icon-about.png");
 
