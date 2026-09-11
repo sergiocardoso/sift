@@ -2,7 +2,7 @@
 
 <p align="center">
   <img
-    src="https://supabase.flokin.com.br/storage/v1/object/public/projects/sift/fefbec4b-ddda-425f-a9f1-8581b4a8f19b.png"
+    src="https://supabase.flokin.com.br/storage/v1/object/public/projects/sift/fc782592-f8e8-40e3-a14c-953971f25711.png"
     alt="Sift"
     width="220"
   />
