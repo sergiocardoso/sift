@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.2] - 2026-09-11
+- `sift-tray`'s tray/About icons now use the current Sift folder-and-sparkle logo instead of the old terminal-window artwork, and per-watch status indicators are colored emoji (🟢 running, ⏸️ paused, ⚪ stopped, ⚠️ config error) instead of plain glyphs. Cosmetic only — no behavior change.
+
 ## [v0.7.0] - 2026-09-10
 - Same-name collisions are now resolved by content instead of always refusing: a file organize would move onto an existing file with byte-identical content is trashed as a redundant duplicate (reversible, via the system trash) instead of being left in place; one with *different* content is still organized, just under a disambiguated name (`"name (1).ext"`) rather than skipped. A destination occupied by a directory or symlink is still refused outright, exactly as before. Applies to every strategy (`type`/`date`/`audio`/`video`/`photos`/`documents`) in both manual organize and Watch, and the executor independently re-verifies a duplicate is *still* identical right before trashing it (never blind to a change between planning and execution).
 - `organize`'s terminal output (dry-run and `--apply`) now always shows a dedicated "Duplicate names handled automatically" section listing exactly what was auto-trashed or auto-renamed and why — never buried in an aggregate count or gated behind `--verbose`. The `Trash` section also now shows each item's reason.

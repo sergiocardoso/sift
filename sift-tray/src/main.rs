@@ -250,12 +250,12 @@ fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
     } else {
         for entry in &watches {
             let indicator = if entry.config_error.is_some() {
-                "⚠"
+                "⚠️"
             } else {
                 match entry.state {
-                    WatchState::Running => "●",
-                    WatchState::Paused => "⏸",
-                    WatchState::Stopped => "○",
+                    WatchState::Running => "🟢",
+                    WatchState::Paused => "⏸️",
+                    WatchState::Stopped => "⚪",
                 }
             };
             let name = entry
