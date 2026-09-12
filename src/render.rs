@@ -24,6 +24,14 @@ pub fn colorize(s: &str, code: &str, enabled: bool) -> String {
     }
 }
 
+/// A small reverse-video " DRY RUN " chip, printed beside the "no changes
+/// made" line so a dry-run result reads as a distinct, glanceable state
+/// rather than just another line of text. Black-on-green like the existing
+/// `✓` success color, so it doesn't introduce a new hue to the palette.
+fn dry_run_badge(enabled: bool) -> String {
+    colorize(" DRY RUN ", "30;42", enabled)
+}
+
 /// Renders a path relative to `base`, purely for display; never changes
 /// what is stored, serialized, or acted on.
 pub fn display_rel(path: &Path, base: &Path) -> String {
@@ -103,7 +111,7 @@ fn render_moves_section(moves: &[&Action], target: &Path) {
         return;
     }
     println!();
-    println!("Moves");
+    println!("🚚 Moves");
     let width = moves
         .iter()
         .map(|a| display_rel(&a.src, target).len())
@@ -125,7 +133,7 @@ fn render_trash_section(title: &str, trashes: &[&Action], target: &Path) {
         return;
     }
     println!();
-    println!("{title}");
+    println!("🗑️ {title}");
     let width = trashes
         .iter()
         .map(|a| display_rel(&a.src, target).len())
@@ -185,7 +193,7 @@ fn render_skip_section(skips: &[&Action], target: &Path, verbose: bool) {
     }
     println!();
     if verbose || skips.len() <= SKIP_LIST_THRESHOLD {
-        println!("Skipped");
+        println!("⚠️ Skipped");
         let width = skips
             .iter()
             .map(|a| display_rel(&a.src, target).len())
@@ -197,7 +205,7 @@ fn render_skip_section(skips: &[&Action], target: &Path, verbose: bool) {
             println!("  {name:<width$}  {reason}");
         }
     } else {
-        println!("Skipped ({})", skips.len());
+        println!("⚠️ Skipped ({})", skips.len());
         let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for a in skips {
             *counts
@@ -253,7 +261,7 @@ pub fn organize_dry_run(path: &str, actions: &[Action], is_project_root: bool, v
     let skips = filter_op(actions, Op::Skip);
 
     println!();
-    println!("Plan");
+    println!("📦 Plan");
     if !moves.is_empty() {
         println!("  {} move{}", moves.len(), plural(moves.len()));
     }
@@ -283,7 +291,7 @@ pub fn organize_dry_run(path: &str, actions: &[Action], is_project_root: bool, v
     if moves.is_empty() && trashes.is_empty() {
         println!("Nothing to do.");
     } else {
-        println!("No changes made.");
+        println!("{} No changes made.", dry_run_badge(use_color()));
         println!("Run with --apply to execute.");
     }
 }
@@ -362,7 +370,7 @@ fn render_protected_section(dir_skips: &[&Action], target: &Path) {
         return;
     }
     println!();
-    println!("Protected");
+    println!("🛡️ Protected");
     let width = dir_skips
         .iter()
         .map(|a| display_rel(&a.src, target).len() + 1)
@@ -405,7 +413,7 @@ pub fn organize_dry_run_recursive(
         .partition(|a| is_traversal_boundary(a));
 
     println!();
-    println!("Recursive scan");
+    println!("🔁 Recursive scan");
     println!(
         "  {dirs_scanned} director{} scanned",
         if dirs_scanned == 1 { "y" } else { "ies" }
@@ -422,7 +430,7 @@ pub fn organize_dry_run_recursive(
     );
 
     println!();
-    println!("Plan");
+    println!("📦 Plan");
     if !moves.is_empty() {
         println!("  {} move{}", moves.len(), plural(moves.len()));
     }
@@ -451,7 +459,7 @@ pub fn organize_dry_run_recursive(
     if moves.is_empty() && trashes.is_empty() {
         println!("Nothing to do.");
     } else {
-        println!("No changes made.");
+        println!("{} No changes made.", dry_run_badge(use_color()));
         println!(
             "Run with --apply to execute {} move{}.",
             moves.len(),
@@ -634,7 +642,7 @@ pub fn clean_dry_run(path: &str, actions: &[Action], is_project_root: bool, verb
     }
 
     println!();
-    println!("No changes made.");
+    println!("{} No changes made.", dry_run_badge(use_color()));
     if !trashes.is_empty() {
         println!(
             "Run with --apply to send {} file{} to Trash.",
@@ -1520,9 +1528,9 @@ pub fn folders_dry_run(fp: &FoldersPlan, dup_removals: &[crate::folders::Duplica
 
     println!();
     if moves.is_empty() && dup_removals.is_empty() {
-        println!("No changes made.");
+        println!("{} No changes made.", dry_run_badge(use_color()));
     } else {
-        println!("No changes made.");
+        println!("{} No changes made.", dry_run_badge(use_color()));
         let mut todo = Vec::new();
         if !moves.is_empty() {
             todo.push(format!(

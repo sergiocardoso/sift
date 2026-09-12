@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.6] - 2026-09-12
+- `organize`/`clean`/`folders` output now marks section headers (Plan, Moves, Trash, Skipped, Protected, Recursive scan) with small icons and a " DRY RUN " badge on the closing "no changes made" line, so a dry-run result reads as a distinct, glanceable state in the terminal. Cosmetic only — no behavior change, and still respects `NO_COLOR`/non-terminal output.
+
 ## [v0.7.5] - 2026-09-11
 - New `sift watch tray` command: explicitly launches the optional `sift-tray` GUI app, reporting exactly what happened (already running, started, not installed, or spawned but never came up) — unlike `watch start`/`resume`'s existing silent, best-effort auto-launch.
 
