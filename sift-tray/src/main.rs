@@ -61,6 +61,12 @@ enum Action {
     /// never touches any file, only the registry entry. Reversible by
     /// just adding the same folder back.
     Remove(PathBuf),
+    /// The background daemon process isn't alive even though one or more
+    /// watches are registered as `running` — spawn one, same as `sift
+    /// watch start` would. Only ever wired up when `daemon_status()`
+    /// reports `NotRunning`, so this is never offered while a real daemon
+    /// already holds the lock.
+    RestartDaemon,
     Quit,
 }
 
@@ -202,6 +208,13 @@ fn main() {
                         Action::Remove(path) => {
                             sift::watch::cmd_watch_remove(path.to_string_lossy().to_string());
                         }
+                        Action::RestartDaemon => {
+                            if let Err(e) =
+                                sift::watch::daemon::ensure_running(Duration::from_secs(3))
+                            {
+                                eprintln!("sift-tray: failed to start watch daemon: {e}");
+                            }
+                        }
                         Action::Quit => {
                             tray.take();
                             *control_flow = ControlFlow::Exit;
@@ -240,6 +253,26 @@ fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
     let add_item = MenuItem::new("Add folder…", true, None);
     actions.insert(add_item.id().clone(), Action::AddFolder);
     let _ = menu.append(&add_item);
+
+    // Ground-truth daemon liveness (an OS file lock, not the registry's
+    // last-known `state`) — the registry can say a watch is "running"
+    // long after the daemon that was supposed to be watching it has
+    // died, which used to leave this menu showing a green dot for
+    // folders nothing was actually monitoring.
+    let daemon_running = matches!(
+        sift::watch::daemon::daemon_status(),
+        sift::watch::daemon::DaemonStatus::Running { .. }
+    );
+    let daemon_label = if daemon_running {
+        "🟢 Daemon running"
+    } else {
+        "🔴 Daemon not running — click to start"
+    };
+    let daemon_item = MenuItem::new(daemon_label, !daemon_running, None);
+    if !daemon_running {
+        actions.insert(daemon_item.id().clone(), Action::RestartDaemon);
+    }
+    let _ = menu.append(&daemon_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let watches = registry::list().unwrap_or_default();
@@ -253,6 +286,10 @@ fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
                 "⚠️"
             } else {
                 match entry.state {
+                    // Registered as running, but no daemon is actually
+                    // alive to watch it — warn instead of claiming it's
+                    // working.
+                    WatchState::Running if !daemon_running => "⚠️",
                     WatchState::Running => "🟢",
                     WatchState::Paused => "⏸️",
                     WatchState::Stopped => "⚪",

@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.7] - 2026-09-12
+- `sift-tray` now shows real daemon health instead of trusting the registry's last-known watch state: a new top-of-menu item reads "🟢 Daemon running" or "🔴 Daemon not running — click to start" (backed by the same OS-lock check as `sift watch daemon status`, clickable to start it on the spot), and any watch registered as `running` while the daemon is actually dead shows ⚠️ instead of a misleading 🟢. Previously the tray could show every folder green even with no daemon process alive to watch them.
+
 ## [v0.7.6] - 2026-09-12
 - `organize`/`clean`/`folders` output now marks section headers (Plan, Moves, Trash, Skipped, Protected, Recursive scan) with small icons and a " DRY RUN " badge on the closing "no changes made" line, so a dry-run result reads as a distinct, glanceable state in the terminal. Cosmetic only — no behavior change, and still respects `NO_COLOR`/non-terminal output.
 
