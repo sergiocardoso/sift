@@ -1311,8 +1311,11 @@ pub fn resolve_policy(root: &str) -> Result<EffectivePolicy, String> {
 /// closed, exactly like `resolve_policy`'s local branch). Shared by
 /// `resolve_policy` (root only) and `resolve_nested_policy_override` (any
 /// directory, walking upward) so both read a local `.sift.toml` the same
-/// way.
-fn local_policy_override(dir: &Path) -> Option<Result<EffectivePolicy, String>> {
+/// way. `pub(crate)` so callers that need to ask "does *this exact*
+/// directory have its own override" (rather than walking upward, as
+/// `resolve_nested_policy_override` does) can reuse the same read/parse
+/// logic instead of re-implementing it.
+pub(crate) fn local_policy_override(dir: &Path) -> Option<Result<EffectivePolicy, String>> {
     let local = dir.join(".sift.toml");
     if !local.is_file() {
         return None;

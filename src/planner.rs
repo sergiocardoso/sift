@@ -1,7 +1,8 @@
 use crate::classifier::CategoryDB;
 use crate::config::{
-    resolve_nested_policy_override, resolve_policy, rules_by_priority, safe_join_under,
-    validate_rule_destination, EffectivePolicy, OrganizeStrategy, Rule, UnknownPolicy,
+    local_policy_override, resolve_nested_policy_override, resolve_policy, rules_by_priority,
+    safe_join_under, validate_rule_destination, EffectivePolicy, OrganizeStrategy, Rule,
+    UnknownPolicy,
 };
 use crate::domain::{Action, Category, Entry, Op, Plan};
 use crate::scanner::{is_project_root, scan_entries};
@@ -1602,14 +1603,49 @@ fn plan_recursive_nested(
                     .and_then(|n| n.to_str())
                     .unwrap_or("");
                 if let Some(reason) = crate::scanner::traversal_reason(&entry) {
-                    entry_actions.push(Action {
-                        src: entry.path.clone(),
-                        dst: None,
-                        op: Op::Skip,
-                        reason: Some(reason.into()),
-                        undoable: false,
-                    });
-                    continue;
+                    // Every other boundary (symlink/project/protected/
+                    // hidden/build output) is a genuine safety limit, never
+                    // overridable by config. A reserved category name is
+                    // different: it's a dead end only because it's
+                    // *normally* one of `policy`'s own destinations —
+                    // exactly the same exception `could_be_own_output_dir`
+                    // grants a custom rule's destination name below, so a
+                    // category-named directory with its own `.sift.toml`
+                    // gets the same treatment instead of being silently
+                    // unreachable.
+                    if reason != "category directory" {
+                        entry_actions.push(Action {
+                            src: entry.path.clone(),
+                            dst: None,
+                            op: Op::Skip,
+                            reason: Some(reason.into()),
+                            undoable: false,
+                        });
+                        continue;
+                    }
+                    match local_policy_override(&entry.path) {
+                        None => {
+                            entry_actions.push(Action {
+                                src: entry.path.clone(),
+                                dst: None,
+                                op: Op::Skip,
+                                reason: Some("own organize destination directory".into()),
+                                undoable: false,
+                            });
+                            continue;
+                        }
+                        Some(Err(e)) => {
+                            entry_actions.push(Action {
+                                src: entry.path.clone(),
+                                dst: None,
+                                op: Op::Skip,
+                                reason: Some(format!("invalid nested .sift.toml: {e}")),
+                                undoable: false,
+                            });
+                            continue;
+                        }
+                        Some(Ok(_)) => {}
+                    }
                 }
                 if !can_descend {
                     entry_actions.push(Action {
@@ -1625,14 +1661,41 @@ fn plan_recursive_nested(
                     continue;
                 }
                 if could_be_own_output_dir(&policy, name) {
-                    entry_actions.push(Action {
-                        src: entry.path.clone(),
-                        dst: None,
-                        op: Op::Skip,
-                        reason: Some("own organize destination directory".into()),
-                        undoable: false,
-                    });
-                    continue;
+                    // Still an incidental drop target of `policy`'s own
+                    // strategy/rules by default — *unless* this exact
+                    // directory declares its own `.sift.toml`, which makes
+                    // it a deliberately governed subtree instead (e.g. an
+                    // `Images/` a `type` strategy fills, itself split
+                    // further by `Images/.sift.toml`'s own rules). Only
+                    // asking "does this directory itself have an
+                    // override" (not walking upward) — inheriting an
+                    // ancestor's override here would mean nothing new, and
+                    // `resolve_nested_policy_override` already re-derives
+                    // the real answer once this directory is popped off
+                    // `pending` below.
+                    match local_policy_override(&entry.path) {
+                        None => {
+                            entry_actions.push(Action {
+                                src: entry.path.clone(),
+                                dst: None,
+                                op: Op::Skip,
+                                reason: Some("own organize destination directory".into()),
+                                undoable: false,
+                            });
+                            continue;
+                        }
+                        Some(Err(e)) => {
+                            entry_actions.push(Action {
+                                src: entry.path.clone(),
+                                dst: None,
+                                op: Op::Skip,
+                                reason: Some(format!("invalid nested .sift.toml: {e}")),
+                                undoable: false,
+                            });
+                            continue;
+                        }
+                        Some(Ok(_)) => {}
+                    }
                 }
                 if policy.strategy == OrganizeStrategy::Date {
                     let template = policy

@@ -510,6 +510,86 @@ fn recursive_never_reenters_a_custom_rule_destination_directory() {
     );
 }
 
+#[test]
+fn recursive_own_output_dir_with_no_override_is_still_never_reentered() {
+    // Same protection as above, but for one of `type`'s reserved category
+    // names instead of a custom `[[rules]]` destination — `Images/` has no
+    // `.sift.toml` of its own, so it must stay a dead end exactly like
+    // before this test's sibling below was added.
+    let d = tempdir().unwrap();
+    let t = d.path();
+    fs::create_dir_all(t.join("Images")).unwrap();
+    fs::write(t.join("Images").join("already-here.jpg"), b"x").unwrap();
+
+    let rp = plan_with_strategy_recursive(
+        t.to_str().unwrap(),
+        &EffectivePolicy::default(),
+        &CategoryDB::default(),
+    );
+
+    assert!(
+        !rp.plan
+            .actions
+            .iter()
+            .any(|a| a.src.ends_with("Images/already-here.jpg")),
+        "a file already sitting in the built-in category's own directory must never be replanned"
+    );
+    let images_dir = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src == t.join("Images"))
+        .unwrap();
+    assert_eq!(images_dir.op, Op::Skip);
+    assert_eq!(
+        images_dir.reason.as_deref(),
+        Some("own organize destination directory")
+    );
+}
+
+#[test]
+fn recursive_nested_sift_toml_governs_its_own_subtree_even_when_named_like_a_builtin_category() {
+    // The exact real-world gap this test guards against: a directory
+    // named after one of `type`'s reserved categories (`Images`) is where
+    // Sift's own built-in classification would naturally put every image
+    // it organizes — so it's tempting for that directory to also want its
+    // own `.sift.toml` splitting things further (by extension, in this
+    // case). Before this fix, `could_be_own_output_dir`'s reserved-name
+    // check fired purely on the literal name "Images" regardless of
+    // whether a nested override existed, so the walk never even
+    // descended into it and the nested config was silently dead.
+    let d = tempdir().unwrap();
+    let t = d.path();
+    fs::create_dir_all(t.join("Images")).unwrap();
+    fs::write(
+        t.join("Images").join(".sift.toml"),
+        "[organize]\nstrategy = \"type\"\nunknown = \"other\"\n\n\
+         [[rules]]\nenabled = true\npattern = \"*.png\"\naction = \"Move\"\ndestination = \"PNG\"\npriority = 100\n",
+    )
+    .unwrap();
+    fs::write(t.join("Images").join("photo.png"), b"x").unwrap();
+
+    let rp = plan_with_strategy_recursive(
+        t.to_str().unwrap(),
+        &EffectivePolicy::default(),
+        &CategoryDB::default(),
+    );
+
+    let photo = rp
+        .plan
+        .actions
+        .iter()
+        .find(|a| a.src.ends_with("Images/photo.png"))
+        .unwrap();
+    assert_eq!(
+        photo.op,
+        Op::Move,
+        "Images/'s own nested .sift.toml rule must have governed photo.png, \
+         not have been skipped as a dead-end category directory"
+    );
+    assert_eq!(photo.dst.as_ref().unwrap(), &t.join("Images/PNG/photo.png"));
+}
+
 // ------------------------------------------------------------------ explain
 
 #[test]

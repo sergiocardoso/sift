@@ -613,6 +613,7 @@ fn watched_json_goes_to_data() {
         let outcome = process_candidate(
             root,
             &EffectivePolicy::default(),
+            &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
         );
@@ -631,6 +632,7 @@ fn watched_unknown_extension_goes_to_other() {
         let outcome = process_candidate(
             root,
             &EffectivePolicy::default(),
+            &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
         );
@@ -648,6 +650,7 @@ fn watched_blend_goes_to_3d() {
     with_isolated_history(root, || {
         let outcome = process_candidate(
             root,
+            &EffectivePolicy::default(),
             &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
@@ -672,16 +675,90 @@ fn watched_config_rule_overrides_builtin_category() {
         enabled: true,
         description: None,
     }];
+    let policy = EffectivePolicy::default().with_rules(rules);
     with_isolated_history(root, || {
         let outcome = process_candidate(
             root,
-            &EffectivePolicy::default().with_rules(rules),
+            &policy,
+            &policy,
             &sift::classifier::CategoryDB::default(),
             &f,
         );
         assert!(outcome.organized);
         assert!(root.join("Scripts/script.js").exists());
         assert!(!root.join("Code/script.js").exists());
+    });
+}
+
+#[test]
+fn process_candidate_ancestor_category_dir_with_no_override_is_a_dead_end() {
+    // The self-generated-loop protection this guards must keep working:
+    // a file already sitting in a reserved category directory that has no
+    // `.sift.toml` of its own must never be reprocessed.
+    let d = tempdir().unwrap();
+    let root = d.path();
+    fs::create_dir_all(root.join("Images")).unwrap();
+    let f = root.join("Images").join("already-here.jpg");
+    fs::write(&f, b"x").unwrap();
+    with_isolated_history(root, || {
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &EffectivePolicy::default(),
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
+        assert!(!outcome.organized);
+        assert_eq!(
+            outcome.skip_reason.as_deref(),
+            Some("ancestor directory is protected")
+        );
+        assert!(
+            f.exists(),
+            "must never move a file already sitting in its own category's directory"
+        );
+    });
+}
+
+#[test]
+fn process_candidate_lets_a_nested_sift_toml_govern_a_directory_named_like_a_builtin_category() {
+    // Real-world scenario this regression-tests: the watch daemon's own
+    // `type` strategy just moved an image into `Images/`, which has its
+    // own `.sift.toml` splitting things further by extension. Before this
+    // fix, `Images` being a reserved category name made the boundary
+    // check treat it as a dead end unconditionally, so the daemon's own
+    // subsequent event for the file landing there was silently dropped
+    // and the nested config never got a chance to run — exactly the bug
+    // this reproduces (`root_policy` is root's own, unrelated policy;
+    // `policy` is what the daemon would already have resolved for this
+    // file's containing directory via `resolve_nested_policy_override`).
+    let d = tempdir().unwrap();
+    let root = d.path();
+    fs::create_dir_all(root.join("Images")).unwrap();
+    fs::write(
+        root.join("Images").join(".sift.toml"),
+        "[organize]\nstrategy = \"type\"\nunknown = \"other\"\n\n\
+         [[rules]]\nenabled = true\npattern = \"*.png\"\naction = \"Move\"\ndestination = \"PNG\"\npriority = 100\n",
+    )
+    .unwrap();
+    let f = root.join("Images").join("photo.png");
+    fs::write(&f, b"x").unwrap();
+    let (nested_policy, owner) =
+        sift::config::resolve_nested_policy_override(root, &root.join("Images"))
+            .expect("Images/ declares its own .sift.toml")
+            .expect("that .sift.toml is valid");
+    assert_eq!(owner, root.join("Images"));
+
+    with_isolated_history(root, || {
+        let outcome = process_candidate(
+            root,
+            &EffectivePolicy::default(),
+            &nested_policy,
+            &sift::classifier::CategoryDB::default(),
+            &f,
+        );
+        assert!(outcome.organized);
+        assert!(root.join("Images/PNG/photo.png").exists());
     });
 }
 
@@ -694,6 +771,7 @@ fn watched_explicit_createdir_is_recorded_in_history() {
     with_isolated_history(root, || {
         let outcome = process_candidate(
             root,
+            &EffectivePolicy::default(),
             &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
@@ -717,6 +795,7 @@ fn watched_collision_with_different_content_is_renamed_never_overwrites() {
     with_isolated_history(root, || {
         let outcome = process_candidate(
             root,
+            &EffectivePolicy::default(),
             &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
@@ -748,6 +827,7 @@ fn watched_collision_with_identical_content_trashes_the_duplicate() {
         let outcome = process_candidate(
             root,
             &EffectivePolicy::default(),
+            &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
         );
@@ -776,6 +856,7 @@ fn watched_broken_symlink_collision_never_overwrites() {
     with_isolated_history(root, || {
         let outcome = process_candidate(
             root,
+            &EffectivePolicy::default(),
             &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
@@ -856,6 +937,7 @@ fn watched_symlink_ancestor_introduced_after_planning_refused() {
         let outcome = process_candidate(
             root,
             &EffectivePolicy::default(),
+            &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
         );
@@ -884,6 +966,7 @@ fn recursive_watch_organizes_in_local_containing_directory() {
         let outcome = process_candidate(
             root,
             &EffectivePolicy::default(),
+            &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
         );
@@ -904,6 +987,7 @@ fn recursive_watch_protects_newly_created_project_subtree() {
     with_isolated_history(root, || {
         let outcome = process_candidate(
             root,
+            &EffectivePolicy::default(),
             &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
@@ -927,6 +1011,7 @@ fn watch_move_records_origin_metadata() {
         let outcome = process_candidate(
             root,
             &EffectivePolicy::default(),
+            &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
         );
@@ -948,6 +1033,7 @@ fn watch_move_can_be_undone_normally() {
     with_isolated_history(root, || {
         let outcome = process_candidate(
             root,
+            &EffectivePolicy::default(),
             &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,
@@ -974,6 +1060,7 @@ fn watch_blocked_collision_is_not_recorded_and_not_undoable() {
         // skip, so no history is written at all (nothing was executed).
         let outcome = process_candidate(
             root,
+            &EffectivePolicy::default(),
             &EffectivePolicy::default(),
             &sift::classifier::CategoryDB::default(),
             &f,

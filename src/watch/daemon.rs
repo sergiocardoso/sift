@@ -533,7 +533,7 @@ impl Daemon {
                     } else {
                         policy
                     };
-                let outcome = process_candidate(root, candidate_policy, &builtin, &path);
+                let outcome = process_candidate(root, policy, candidate_policy, &builtin, &path);
                 if outcome.organized {
                     let _ = registry::record_success(root, 1);
                 } else if let Some(err) = &outcome.failure {

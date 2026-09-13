@@ -200,8 +200,19 @@ pub fn revalidate_candidate(root: &Path, path: &Path) -> Result<Entry, &'static 
         if dir == root {
             continue;
         }
-        if traversal_reason(&entry).is_some() {
-            return Err("ancestor directory is protected");
+        if let Some(reason) = traversal_reason(&entry) {
+            // A reserved category name is a dead end only because it's
+            // *normally* one of the governing policy's own destinations —
+            // a directory with its own `.sift.toml` is a deliberately
+            // governed subtree instead (see `planner::could_be_own_output_dir`
+            // and its callers for the same exception). Every other
+            // boundary here (symlink/project/protected/hidden/build
+            // output) is a genuine safety limit, never overridable.
+            let has_own_override = reason == "category directory"
+                && crate::config::local_policy_override(dir).is_some_and(|r| r.is_ok());
+            if !has_own_override {
+                return Err("ancestor directory is protected");
+            }
         }
     }
 

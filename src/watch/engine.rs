@@ -29,23 +29,36 @@ pub struct ProcessOutcome {
 }
 
 /// Whether any directory component between `watch_root` and `path` (i.e.
-/// every ancestor, not `path` itself) could be one of `policy`'s own
-/// organize destinations — either a rendered Date template component (the
-/// same structural question `discover_recursive_dirs_for_date` asks during
-/// recursive organize, asked here of one live path instead of a whole
-/// tree), or a static `type` destination (`planner::could_be_own_output_dir`
-/// — a built-in category name, or an explicit `[[rules]]` `Move`
-/// destination). This is what keeps a recursive watch from ever
-/// reprocessing its own self-generated destination event
-/// (`2026/09/invoice.pdf` right after moving `invoice.pdf` there, or
-/// `PDF/report.pdf` right after a `*.pdf -> "PDF"` rule moved it) into
-/// `2026/09/2026/09/invoice.pdf` or `PDF/PDF/report.pdf` — no arbitrary
-/// sleep, just the same policy object asked the same yes/no question
-/// planning already relies on.
+/// every ancestor, not `path` itself) could be one of *the policy
+/// governing its own parent*'s organize destinations — either a rendered
+/// Date template component (the same structural question
+/// `discover_recursive_dirs_for_date` asks during recursive organize,
+/// asked here of one live path instead of a whole tree), or a static
+/// `type` destination (`planner::could_be_own_output_dir` — a built-in
+/// category name, or an explicit `[[rules]]` `Move` destination). This is
+/// what keeps a recursive watch from ever reprocessing its own
+/// self-generated destination event (`2026/09/invoice.pdf` right after
+/// moving `invoice.pdf` there, or `PDF/report.pdf` right after a
+/// `*.pdf -> "PDF"` rule moved it) into `2026/09/2026/09/invoice.pdf` or
+/// `PDF/PDF/report.pdf`.
+///
+/// Walks ancestors top-down from `watch_root`, re-deriving which policy
+/// actually governs each one (starting from `root_policy`, switching to a
+/// directory's own local `.sift.toml` whenever one exists) rather than
+/// checking every ancestor against one flat, already-leaf-resolved
+/// policy. That distinction matters whenever an ancestor's name happens
+/// to collide with a reserved category name (`Images`, `Documents`, ...):
+/// an ordinary `Images/` with no override of its own is still correctly
+/// treated as `watch_root`'s own dead-end destination, but an `Images/`
+/// that declares its *own* `.sift.toml` is a deliberately governed
+/// subtree instead — the same precedence
+/// `config::resolve_nested_policy_override` gives it everywhere else —
+/// and must not be treated as a boundary just because its name also
+/// happens to be a built-in category.
 fn crosses_strategy_generated_boundary(
     watch_root: &Path,
     path: &Path,
-    policy: &EffectivePolicy,
+    root_policy: &EffectivePolicy,
 ) -> bool {
     let Ok(rel) = path.strip_prefix(watch_root) else {
         return false;
@@ -54,18 +67,36 @@ fn crosses_strategy_generated_boundary(
     if components.is_empty() {
         return false;
     }
-    components[..components.len() - 1].iter().any(|c| {
+    let mut governing = root_policy.clone();
+    let mut dir = watch_root.to_path_buf();
+    for c in &components[..components.len() - 1] {
         let std::path::Component::Normal(name) = c else {
-            return false;
+            continue;
         };
         let name = name.to_string_lossy();
-        if let Some(template) = &policy.template {
+        if let Some(template) = &governing.template {
             if template.component_could_be_generated(0, &name) {
                 return true;
             }
         }
-        crate::planner::could_be_own_output_dir(policy, &name)
-    })
+        let child_dir = dir.join(name.as_ref());
+        if crate::planner::could_be_own_output_dir(&governing, &name) {
+            match crate::config::local_policy_override(&child_dir) {
+                Some(Ok(_)) => {}
+                // No override of its own (or an invalid one, which fails
+                // closed the same way it does everywhere else) — an
+                // incidental drop target, not a governed subtree, so it's
+                // exactly the self-generated destination this boundary
+                // check exists to catch.
+                _ => return true,
+            }
+        }
+        if let Some(Ok(p)) = crate::config::local_policy_override(&child_dir) {
+            governing = p;
+        }
+        dir = child_dir;
+    }
+    false
 }
 
 /// Processes exactly one stabilized candidate: re-validates it against the
@@ -73,8 +104,19 @@ fn crosses_strategy_generated_boundary(
 /// plans its action with the same per-entry planner manual organize uses,
 /// and executes with the same executor — never anything file-specific
 /// invented here. Touches no file other than `path`.
+///
+/// `root_policy` and `policy` are deliberately separate: `policy` is
+/// whichever policy actually governs `path`'s own containing directory
+/// (the caller already resolved this — root's own, or a nested
+/// `.sift.toml`'s override — and it's what plans/executes this specific
+/// file), while `root_policy` is always `watch_root`'s own policy,
+/// needed by `crosses_strategy_generated_boundary` to walk ancestors from
+/// the top rather than from whichever policy the leaf happened to
+/// resolve to. For a candidate sitting directly under `watch_root`
+/// they're the same value.
 pub fn process_candidate(
     watch_root: &Path,
+    root_policy: &EffectivePolicy,
     policy: &EffectivePolicy,
     builtin: &CategoryDB,
     path: &Path,
@@ -90,7 +132,7 @@ pub fn process_candidate(
             }
         }
     };
-    if crosses_strategy_generated_boundary(watch_root, path, policy) {
+    if crosses_strategy_generated_boundary(watch_root, path, root_policy) {
         return ProcessOutcome {
             organized: false,
             skip_reason: Some("date-organized directory".to_string()),
@@ -202,7 +244,13 @@ mod tests {
         fs::write(&file, b"x").unwrap();
 
         sift_history_isolated(root, || {
-            let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
+            let outcome = process_candidate(
+                root,
+                &default_policy(),
+                &default_policy(),
+                &CategoryDB::default(),
+                &file,
+            );
             assert!(outcome.organized);
             assert!(outcome.failure.is_none());
             assert!(root.join("Images/photo.jpg").exists());
@@ -218,7 +266,13 @@ mod tests {
         fs::write(&file, b"x").unwrap();
 
         sift_history_isolated(root, || {
-            let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
+            let outcome = process_candidate(
+                root,
+                &default_policy(),
+                &default_policy(),
+                &CategoryDB::default(),
+                &file,
+            );
             assert!(!outcome.organized);
             assert_eq!(outcome.skip_reason.as_deref(), Some("candidate is hidden"));
             assert!(file.exists());
@@ -237,7 +291,13 @@ mod tests {
         fs::write(root.join("app/package.json"), b"{}").unwrap();
 
         sift_history_isolated(root, || {
-            let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
+            let outcome = process_candidate(
+                root,
+                &default_policy(),
+                &default_policy(),
+                &CategoryDB::default(),
+                &file,
+            );
             assert!(!outcome.organized);
             assert!(outcome.skip_reason.is_some());
             assert!(file.exists());
@@ -254,7 +314,13 @@ mod tests {
         fs::write(&file, b"new").unwrap();
 
         sift_history_isolated(root, || {
-            let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
+            let outcome = process_candidate(
+                root,
+                &default_policy(),
+                &default_policy(),
+                &CategoryDB::default(),
+                &file,
+            );
             assert!(outcome.organized);
             assert!(!file.exists());
             assert_eq!(
@@ -278,7 +344,13 @@ mod tests {
         fs::write(&file, b"same").unwrap();
 
         sift_history_isolated(root, || {
-            let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
+            let outcome = process_candidate(
+                root,
+                &default_policy(),
+                &default_policy(),
+                &CategoryDB::default(),
+                &file,
+            );
             assert!(!outcome.organized);
             assert!(!file.exists());
             assert_eq!(
@@ -298,7 +370,13 @@ mod tests {
         fs::write(&file, b"new").unwrap();
 
         sift_history_isolated(root, || {
-            let outcome = process_candidate(root, &default_policy(), &CategoryDB::default(), &file);
+            let outcome = process_candidate(
+                root,
+                &default_policy(),
+                &default_policy(),
+                &CategoryDB::default(),
+                &file,
+            );
             assert!(!outcome.organized);
             assert_eq!(outcome.skip_reason.as_deref(), Some("collision"));
             assert!(file.exists());
