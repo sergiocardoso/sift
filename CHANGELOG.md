@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.12] - 2026-09-13
+- `sift-tray` now hides "Open folder" and "Reapply now" entirely — not just disables them — for a watch whose root folder was itself deleted or moved (`WATCH_ROOT_MISSING_ERROR`, a new shared constant so the tray and the daemon can never drift on the exact message): neither action has anything left to act on. Left in place (merely disabled, as of v0.7.11) for the other kind of broken watch, an invalid `.sift.toml` — there the folder still exists, and "Open folder" is exactly how you'd go fix it.
+
 ## [v0.7.11] - 2026-09-13
 - `sift-tray`'s ⚠️ indicator for a broken watch (deleted/moved root, or an invalid `.sift.toml`) previously required clicking an action just to discover why — the submenu itself looked identical to a healthy watch's. It now shows the actual error message as a disabled line right at the top of the submenu, and disables "Reapply now" outright (organize can't do useful work either way). "Open folder" stays enabled, since the folder most often still exists in this state — an invalid `.sift.toml` right inside it is the usual cause, and opening it is how you'd go fix that file.
 

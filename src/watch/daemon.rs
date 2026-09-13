@@ -34,6 +34,15 @@ use std::time::{Duration, Instant, SystemTime};
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 const EVENT_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// The exact `config_error` message `refresh_policy` records when a
+/// watch's own root directory has been deleted or moved. `pub` (not just
+/// an inline literal) so a caller checking *why* a watch is unhealthy —
+/// `sift-tray`'s menu hides "Open folder"/"Reapply now" entirely for this
+/// specific case, since neither can do anything useful — can match on it
+/// without duplicating the string and risking the two silently drifting
+/// apart.
+pub const WATCH_ROOT_MISSING_ERROR: &str = "watch root no longer exists";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonInfo {
     pid: u32,
@@ -230,7 +239,7 @@ impl Daemon {
             // becomes visible the same way any other broken watch is —
             // and self-heals the same way once the folder reappears.
             let just_became_unhealthy = self.unhealthy.insert(root.to_path_buf());
-            let msg = "watch root no longer exists".to_string();
+            let msg = WATCH_ROOT_MISSING_ERROR.to_string();
             let _ = registry::set_config_health(root, Some(msg.clone()));
             if just_became_unhealthy {
                 if let Some(w) = self.roots.get_mut(root) {

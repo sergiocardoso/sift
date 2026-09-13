@@ -414,36 +414,40 @@ fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
             // deleted/moved root and an invalid `.sift.toml`, since both
             // land in the same `config_error` field.
             let broken = entry.config_error.is_some();
+            // The one sub-case where the folder itself is truly gone, not
+            // just its config — distinguished so `Open folder`/`Reapply
+            // now` can be left out entirely below instead of merely
+            // disabled, since neither has anything left to act on at all.
+            let root_missing = entry.config_error.as_deref()
+                == Some(sift::watch::daemon::WATCH_ROOT_MISSING_ERROR);
             if let Some(error) = &entry.config_error {
                 let error_item = MenuItem::new(format!("⚠️ {error}"), false, None);
                 let _ = submenu.append(&error_item);
                 let _ = submenu.append(&PredefinedMenuItem::separator());
             }
 
-            // `Open folder` stays enabled even when broken: the folder
-            // most commonly still exists in this state (an invalid
-            // `.sift.toml` right inside it is the usual cause), and
-            // opening it is exactly how someone would go fix that file.
-            // Its own `notify_if_folder_missing` guard already covers the
-            // one case where it truly can't do anything (root deleted).
-            let open_item = MenuItem::new("Open folder", true, None);
-            actions.insert(
-                open_item.id().clone(),
-                Action::OpenFolder(entry.path.clone()),
-            );
-            let _ = submenu.append(&open_item);
+            if !root_missing {
+                // Enabled even when broken by an invalid `.sift.toml`: the
+                // folder still exists in that case, and opening it is
+                // exactly how someone would go fix that file.
+                let open_item = MenuItem::new("Open folder", true, None);
+                actions.insert(
+                    open_item.id().clone(),
+                    Action::OpenFolder(entry.path.clone()),
+                );
+                let _ = submenu.append(&open_item);
 
-            // `Reapply now` disabled outright when broken: organize can't
-            // do useful work against a root whose own policy failed to
-            // resolve, in either sub-case (deleted folder, invalid
-            // `.sift.toml`) — no point offering a click guaranteed to
-            // report failure.
-            let reapply_item = MenuItem::new("Reapply now", !broken, None);
-            actions.insert(
-                reapply_item.id().clone(),
-                Action::Reapply(entry.path.clone()),
-            );
-            let _ = submenu.append(&reapply_item);
+                // Disabled outright when broken: organize can't do useful
+                // work against a root whose own policy failed to resolve
+                // — no point offering a click guaranteed to report
+                // failure.
+                let reapply_item = MenuItem::new("Reapply now", !broken, None);
+                actions.insert(
+                    reapply_item.id().clone(),
+                    Action::Reapply(entry.path.clone()),
+                );
+                let _ = submenu.append(&reapply_item);
+            }
 
             let running = entry.state == WatchState::Running;
             let toggle_label = if running { "Pause" } else { "Resume" };
