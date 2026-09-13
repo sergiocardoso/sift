@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.7.10] - 2026-09-13
+- Fixed a watch whose registered root folder was deleted or moved failing completely silently: the daemon's `reconcile` never distinguished "no `.sift.toml` here" from "this directory doesn't exist at all", so it kept retrying the watcher registration forever with nothing ever surfaced — `sift watch status`/`sift watch list` kept reporting stale "healthy". The watch now gets the same `Configuration error: watch root no longer exists` / "suspended" treatment `sift watch status` already gives an invalid `.sift.toml`, and clears automatically once the folder reappears. `sift-tray`'s existing ⚠️ indicator for a watch with a config error now covers this case too, for free.
+- `sift-tray`'s "Open folder" and "Reapply now" also used to do nothing at all against a deleted/moved watch root, with no indication why (`cmd_organize` against a missing directory just plans zero moves, indistinguishable from "already organized"; the spawned file-manager command reports nothing back either way). Both now check first and show a notification naming the folder instead of silently no-opping.
+
 ## [v0.7.9] - 2026-09-13
 - `sift-tray`'s "Reapply now" no longer runs silently: a native desktop notification (via `notify-rust`, over D-Bus on Linux / Notification Center on macOS) now reports how many files were organized, that nothing needed to change, or that the run failed — previously the only feedback was a menu that looks the same before and after, since `cmd_organize` only ever prints to a terminal a tray process doesn't have. Best-effort: a notification failure (no notification daemon running, unsupported environment) is silently dropped and never affects the actual organize.
 

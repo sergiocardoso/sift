@@ -372,6 +372,42 @@ fn daemon_reconcile_drops_monitor_when_watch_stops() {
 }
 
 #[test]
+fn daemon_reconcile_reports_health_error_when_watch_root_vanishes_and_clears_it_on_return() {
+    // Before this test's fix, a deleted/moved watch root failed
+    // completely silently: `resolve_policy` falls back to the
+    // global/default policy rather than erroring (there's simply no
+    // `.sift.toml` to find), so nothing ever marked the watch unhealthy —
+    // `sift watch status` kept reporting stale "healthy" forever, and
+    // `reconcile`'s `watcher.watch()` call just kept failing every tick
+    // with nothing surfaced anywhere.
+    with_isolated_registry(|root| {
+        let w = root.join("w").canonicalize_dir();
+        add(w.clone(), true, false).unwrap();
+        transition(&w, WatchState::Running).unwrap();
+
+        let mut d = Daemon::new().unwrap();
+        d.reconcile();
+        assert!(d.is_monitoring(&w));
+        assert_eq!(find(&w).unwrap().unwrap().config_error, None);
+
+        fs::remove_dir_all(&w).unwrap();
+        d.reconcile();
+        assert_eq!(
+            find(&w).unwrap().unwrap().config_error.as_deref(),
+            Some("watch root no longer exists")
+        );
+
+        fs::create_dir_all(&w).unwrap();
+        d.reconcile();
+        assert_eq!(
+            find(&w).unwrap().unwrap().config_error,
+            None,
+            "must self-heal once the folder reappears, exactly like an invalid .sift.toml being fixed"
+        );
+    });
+}
+
+#[test]
 fn daemon_reconcile_rebuilds_monitor_when_recursive_changes_while_running() {
     with_isolated_registry(|root| {
         let w = root.join("w").canonicalize_dir();

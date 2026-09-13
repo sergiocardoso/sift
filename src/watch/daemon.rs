@@ -216,6 +216,29 @@ impl Daemon {
     /// already-recursive watch to `strategy = "audio"` after the fact —
     /// `cmd_watch_add` only catches this combination at registration time.
     fn refresh_policy(&mut self, root: &Path, recursive: bool) -> Result<EffectivePolicy, String> {
+        if !root.is_dir() {
+            // The watch root itself was deleted or moved out from under
+            // the daemon. Without this check `resolve_policy` would just
+            // silently fall back to the global/default policy (no
+            // `.sift.toml` there to find, but no error either) and
+            // `reconcile`'s `watcher.watch()` call would keep failing
+            // forever, every tick, with nothing ever surfaced anywhere —
+            // `sift watch status` would keep reporting stale "healthy",
+            // and `sift-tray` would keep showing a plain green dot. Fail
+            // closed exactly like an invalid `.sift.toml` (same
+            // `unhealthy`/`set_config_health` path below), so this
+            // becomes visible the same way any other broken watch is —
+            // and self-heals the same way once the folder reappears.
+            let just_became_unhealthy = self.unhealthy.insert(root.to_path_buf());
+            let msg = "watch root no longer exists".to_string();
+            let _ = registry::set_config_health(root, Some(msg.clone()));
+            if just_became_unhealthy {
+                if let Some(w) = self.roots.get_mut(root) {
+                    w.monitor.discard_pending();
+                }
+            }
+            return Err(msg);
+        }
         let local_path = root.join(".sift.toml");
         let current_mtime = fs::metadata(&local_path).and_then(|m| m.modified()).ok();
 

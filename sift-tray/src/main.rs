@@ -128,6 +128,39 @@ fn count_planned_moves(path: &str, recursive: bool) -> Option<usize> {
     )
 }
 
+/// The name shown for a watch in a notification — just the folder's own
+/// name, falling back to the full path for the rare case it has none
+/// (root-relative oddities, trailing `..`).
+fn folder_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Guards `Open folder` and `Reapply now` against a watch root that's been
+/// deleted or moved out from under it since it was registered — both used
+/// to do nothing at all in that case, with no indication why: a spawned
+/// file-manager command whose target no longer exists reports nothing back
+/// (`open_in_file_manager` doesn't wait on it, and even if it did, the
+/// spawn itself still succeeds), and `cmd_organize` against a missing
+/// directory just plans zero moves (`scanner::scan_entries` treats a
+/// failed `read_dir` as "empty", not an error) — indistinguishable from
+/// "already organized". Returns `true` (after notifying) when the folder
+/// is missing, so the caller can skip doing the now-pointless action.
+fn notify_if_folder_missing(path: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+    let name = folder_display_name(path);
+    let _ = notify_rust::Notification::new()
+        .summary("Sift")
+        .body(&format!(
+            "{name}: this folder no longer exists. Remove the watch (or restore the folder) from the tray menu."
+        ))
+        .show();
+    true
+}
+
 /// Best-effort native desktop notification summarizing one "Reapply now"
 /// click — the only feedback a tray click otherwise gets, since the click
 /// itself doesn't visibly change the menu (a Move doesn't touch any watch's
@@ -136,10 +169,7 @@ fn count_planned_moves(path: &str, recursive: bool) -> Option<usize> {
 /// notification daemon running, unsupported platform, ...) affect anything
 /// else — errors are silently dropped.
 fn notify_reapply_result(path: &Path, planned_moves: Option<usize>, ok: bool) {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string());
+    let name = folder_display_name(path);
     let body = if !ok {
         format!("{name}: reapply failed — check the folder or run `sift organize` for details.")
     } else {
@@ -194,7 +224,11 @@ fn main() {
             Event::UserEvent(UserEvent::MenuEvent(event)) => {
                 if let Some(action) = actions.get(&event.id) {
                     match action {
-                        Action::OpenFolder(path) => open_in_file_manager(path),
+                        Action::OpenFolder(path) => {
+                            if !notify_if_folder_missing(path) {
+                                open_in_file_manager(path);
+                            }
+                        }
                         Action::TogglePause(path, currently_running) => {
                             let path_str = path.to_string_lossy().to_string();
                             if *currently_running {
@@ -208,27 +242,37 @@ fn main() {
                             sift::watch::cmd_watch_set_recursive(path_str, !*currently_recursive);
                         }
                         Action::Reapply(path) => {
-                            // Use whatever --recursive scope is currently
-                            // registered for this watch, same as the
-                            // daemon itself would.
-                            let recursive = registry::find(path)
-                                .ok()
-                                .flatten()
-                                .map(|e| e.recursive)
-                                .unwrap_or(false);
-                            let path_str = path.to_string_lossy().to_string();
-                            // Planned separately, purely to report a count —
-                            // a dry, read-only pass, computed just before the
-                            // real (mutating) one below. `cmd_organize`
-                            // itself only prints to stdout/stderr, which a
-                            // tray process has no visible terminal for, so
-                            // there'd otherwise be no feedback at all that a
-                            // click did anything.
-                            let planned_moves = count_planned_moves(&path_str, recursive);
-                            let ok = sift::planner::cmd_organize(
-                                path_str, true, false, false, recursive,
-                            );
-                            notify_reapply_result(path, planned_moves, ok);
+                            // A deleted/moved watch root would otherwise
+                            // fail completely silently here: `scan_entries`
+                            // treats a failed `read_dir` as "empty
+                            // directory" rather than an error, so
+                            // `cmd_organize` would just plan and report
+                            // zero moves — indistinguishable from "already
+                            // organized".
+                            if !notify_if_folder_missing(path) {
+                                // Use whatever --recursive scope is
+                                // currently registered for this watch, same
+                                // as the daemon itself would.
+                                let recursive = registry::find(path)
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| e.recursive)
+                                    .unwrap_or(false);
+                                let path_str = path.to_string_lossy().to_string();
+                                // Planned separately, purely to report a
+                                // count — a dry, read-only pass, computed
+                                // just before the real (mutating) one
+                                // below. `cmd_organize` itself only prints
+                                // to stdout/stderr, which a tray process
+                                // has no visible terminal for, so there'd
+                                // otherwise be no feedback at all that a
+                                // click did anything.
+                                let planned_moves = count_planned_moves(&path_str, recursive);
+                                let ok = sift::planner::cmd_organize(
+                                    path_str, true, false, false, recursive,
+                                );
+                                notify_reapply_result(path, planned_moves, ok);
+                            }
                         }
                         Action::AddFolder => {
                             // Blocks the event loop briefly while the
