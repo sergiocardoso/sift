@@ -1,6 +1,6 @@
 [package]
 name = "sift-tray"
-version = "0.7.8"
+version = "0.7.9"
 edition = "2021"
 authors = ["Sérgio Cardoso"]
 description = "Optional system tray / menu bar UI listing sift's watched folders."
@@ -12,3 +12,4 @@ tray-icon = "0.24"
 tao = "0.37"
 rfd = "0.17.2"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+notify-rust = "4.18.0"

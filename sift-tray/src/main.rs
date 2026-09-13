@@ -102,6 +102,60 @@ fn acquire_singleton_lock_or_exit() -> std::fs::File {
     file
 }
 
+/// Plans (never executes) exactly what `cmd_organize(path, apply: true, ...,
+/// recursive)` is about to do, purely to count how many files it will move —
+/// `cmd_organize` itself reports nothing back beyond success/failure.
+/// `None` means the policy couldn't even be resolved (`cmd_organize` will
+/// hit the exact same error and report `ok: false`). A concurrently-running
+/// Watch daemon on the same root could in principle move something between
+/// this read-only pass and the real one, making the count momentarily
+/// stale — acceptable for a manual, occasional "Reapply now" click.
+fn count_planned_moves(path: &str, recursive: bool) -> Option<usize> {
+    let policy = sift::config::resolve_policy(path).ok()?;
+    let builtin = sift::classifier::CategoryDB::default();
+    let actions = if recursive {
+        sift::planner::plan_with_strategy_recursive(path, &policy, &builtin)
+            .plan
+            .actions
+    } else {
+        sift::planner::plan_with_strategy(path, &policy, &builtin).actions
+    };
+    Some(
+        actions
+            .iter()
+            .filter(|a| a.op == sift::domain::Op::Move)
+            .count(),
+    )
+}
+
+/// Best-effort native desktop notification summarizing one "Reapply now"
+/// click — the only feedback a tray click otherwise gets, since the click
+/// itself doesn't visibly change the menu (a Move doesn't touch any watch's
+/// registered `state`) and `cmd_organize` only ever prints to a terminal
+/// this GUI process doesn't have. Never lets a notification failure (no
+/// notification daemon running, unsupported platform, ...) affect anything
+/// else — errors are silently dropped.
+fn notify_reapply_result(path: &Path, planned_moves: Option<usize>, ok: bool) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let body = if !ok {
+        format!("{name}: reapply failed — check the folder or run `sift organize` for details.")
+    } else {
+        match planned_moves {
+            Some(0) => format!("{name}: already organized, nothing to do."),
+            Some(1) => format!("{name}: 1 file organized."),
+            Some(n) => format!("{name}: {n} files organized."),
+            None => format!("{name}: reapply finished."),
+        }
+    };
+    let _ = notify_rust::Notification::new()
+        .summary("Sift")
+        .body(&body)
+        .show();
+}
+
 fn main() {
     let _singleton_lock = acquire_singleton_lock_or_exit();
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
@@ -162,13 +216,19 @@ fn main() {
                                 .flatten()
                                 .map(|e| e.recursive)
                                 .unwrap_or(false);
-                            sift::planner::cmd_organize(
-                                path.to_string_lossy().to_string(),
-                                true,
-                                false,
-                                false,
-                                recursive,
+                            let path_str = path.to_string_lossy().to_string();
+                            // Planned separately, purely to report a count —
+                            // a dry, read-only pass, computed just before the
+                            // real (mutating) one below. `cmd_organize`
+                            // itself only prints to stdout/stderr, which a
+                            // tray process has no visible terminal for, so
+                            // there'd otherwise be no feedback at all that a
+                            // click did anything.
+                            let planned_moves = count_planned_moves(&path_str, recursive);
+                            let ok = sift::planner::cmd_organize(
+                                path_str, true, false, false, recursive,
                             );
+                            notify_reapply_result(path, planned_moves, ok);
                         }
                         Action::AddFolder => {
                             // Blocks the event loop briefly while the
