@@ -449,28 +449,36 @@ fn build_menu() -> (Menu, HashMap<MenuId, Action>) {
                 let _ = submenu.append(&reapply_item);
             }
 
-            let running = entry.state == WatchState::Running;
-            let toggle_label = if running { "Pause" } else { "Resume" };
-            let toggle_item = MenuItem::new(toggle_label, true, None);
-            actions.insert(
-                toggle_item.id().clone(),
-                Action::TogglePause(entry.path.clone(), running),
-            );
-            let _ = submenu.append(&toggle_item);
+            if !root_missing {
+                // Pausing or toggling recursion is still a meaningful,
+                // registry-only state change for an invalid-config watch
+                // (or a healthy one) — but not for a watch whose folder is
+                // simply gone, where `Remove` is the only action that
+                // still means anything.
+                let running = entry.state == WatchState::Running;
+                let toggle_label = if running { "Pause" } else { "Resume" };
+                let toggle_item = MenuItem::new(toggle_label, true, None);
+                actions.insert(
+                    toggle_item.id().clone(),
+                    Action::TogglePause(entry.path.clone(), running),
+                );
+                let _ = submenu.append(&toggle_item);
 
-            let _ = submenu.append(&PredefinedMenuItem::separator());
+                let _ = submenu.append(&PredefinedMenuItem::separator());
 
-            // Rebuilt from scratch on every refresh (like the rest of
-            // this menu), so `checked` just reflects the registry as of
-            // right now — no manual `set_checked` bookkeeping needed.
-            let recursive_item = CheckMenuItem::new("Recursive", true, entry.recursive, None);
-            actions.insert(
-                recursive_item.id().clone(),
-                Action::ToggleRecursive(entry.path.clone(), entry.recursive),
-            );
-            let _ = submenu.append(&recursive_item);
+                // Rebuilt from scratch on every refresh (like the rest of
+                // this menu), so `checked` just reflects the registry as
+                // of right now — no manual `set_checked` bookkeeping
+                // needed.
+                let recursive_item = CheckMenuItem::new("Recursive", true, entry.recursive, None);
+                actions.insert(
+                    recursive_item.id().clone(),
+                    Action::ToggleRecursive(entry.path.clone(), entry.recursive),
+                );
+                let _ = submenu.append(&recursive_item);
 
-            let _ = submenu.append(&PredefinedMenuItem::separator());
+                let _ = submenu.append(&PredefinedMenuItem::separator());
+            }
 
             let remove_item = MenuItem::new("Remove", true, None);
             actions.insert(remove_item.id().clone(), Action::Remove(entry.path.clone()));

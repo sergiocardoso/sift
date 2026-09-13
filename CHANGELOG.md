@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.13] - 2026-09-13
+- `sift-tray` now hides "Pause"/"Resume" and the "Recursive" checkbox too for a watch whose root folder was deleted or moved, leaving only "Remove" (plus the error line and "About"/"Quit") — neither toggle changes anything meaningful once there's no folder left to watch. Still shown as before for the other kind of broken watch, an invalid `.sift.toml`, where pausing or changing scope remains an ordinary, meaningful registry change.
+
 ## [v0.7.12] - 2026-09-13
 - `sift-tray` now hides "Open folder" and "Reapply now" entirely — not just disables them — for a watch whose root folder was itself deleted or moved (`WATCH_ROOT_MISSING_ERROR`, a new shared constant so the tray and the daemon can never drift on the exact message): neither action has anything left to act on. Left in place (merely disabled, as of v0.7.11) for the other kind of broken watch, an invalid `.sift.toml` — there the folder still exists, and "Open folder" is exactly how you'd go fix it.
 
