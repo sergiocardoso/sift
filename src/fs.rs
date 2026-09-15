@@ -159,10 +159,25 @@ pub fn send_to_trash(src: &PathBuf) -> Result<(), FSActionError> {
 /// disappearing or becoming unreadable mid-comparison) is surfaced rather
 /// than guessed at either way — callers treat `Err` as "cannot safely
 /// tell", never as a silent "yes" or "no".
+///
+/// Both sides are checked with *no-follow* metadata and must be plain
+/// regular files. This matters at execution time: the duplicate-`Trash`
+/// re-verification runs after planning, and a symlink swapped in for either
+/// path could otherwise make a file appear to be a duplicate of itself (a
+/// symlink at the destination pointing back at the source), letting the
+/// only real copy be trashed on a false redundancy premise. A symlink,
+/// directory or other non-regular file makes this return `Err`, which both
+/// callers already treat as "refuse".
 pub fn files_have_identical_content(a: &Path, b: &Path) -> std::io::Result<bool> {
     use std::io::Read;
-    let meta_a = fs::metadata(a)?;
-    let meta_b = fs::metadata(b)?;
+    let meta_a = fs::symlink_metadata(a)?;
+    let meta_b = fs::symlink_metadata(b)?;
+    if !meta_a.file_type().is_file() || !meta_b.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to compare: not a plain regular file",
+        ));
+    }
     if meta_a.len() != meta_b.len() {
         return Ok(false);
     }

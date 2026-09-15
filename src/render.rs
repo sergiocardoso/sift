@@ -4,7 +4,8 @@
 //! fact, what a `Plan` or a set of `ActionResult`s means to a person. All
 //! `--json` output bypasses this module entirely and is untouched by it.
 
-use crate::domain::{Action, ActionResult, Entry, HistoryItem, Op};
+use crate::domain::{Action, ActionResult, ActionState, Entry, ExecutionState, HistoryItem, Op};
+use crate::executor::{ExecutionError, ExecutionFailure};
 use crate::folders::{Decision, FolderCandidate, FoldersPlan};
 use crate::scanner::DoctorFinding;
 use std::path::Path;
@@ -830,22 +831,47 @@ pub fn doctor(path: &str, findings: &[DoctorFinding]) {
 // --------------------------------------------------------------- history
 
 pub fn history(items: &[HistoryItem]) {
-    println!("History");
-    println!();
+    print!("{}", history_text(items));
+}
+
+/// Pure, testable rendering of `sift history`. Kept separate from
+/// `history()` so tests can assert on the text (in particular that an
+/// interrupted execution is never presented as a normal completed one).
+pub fn history_text(items: &[HistoryItem]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    out.push_str("History\n\n");
     if items.is_empty() {
-        println!("No operations recorded yet.");
-        return;
+        out.push_str("No operations recorded yet.\n");
+        return out;
     }
     let mut sorted: Vec<&HistoryItem> = items.iter().collect();
     sorted.sort_by_key(|item| std::cmp::Reverse(item.timestamp));
 
     for item in sorted {
-        let moved = count_ok(&item.outcomes, Op::Move);
-        let moved_dirs = count_ok(&item.outcomes, Op::MoveDir);
-        let created = count_ok(&item.outcomes, Op::CreateDir);
-        let trashed = count_ok(&item.outcomes, Op::Trash);
-        let skipped = item.outcomes.iter().filter(|o| o.op == Op::Skip).count();
-        let failed = item.outcomes.iter().filter(|o| o.result.is_err()).count();
+        let mut moved = 0usize;
+        let mut moved_dirs = 0usize;
+        let mut created = 0usize;
+        let mut trashed = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        for i in 0..item.actions.len() {
+            // Keyed on durable per-action state, not on the raw outcome
+            // list, so an interrupted `prepared` action is never counted as
+            // a success or a failure.
+            match item.state_of(i) {
+                ActionState::Succeeded => match item.actions[i].op {
+                    Op::Move => moved += 1,
+                    Op::MoveDir => moved_dirs += 1,
+                    Op::CreateDir => created += 1,
+                    Op::Trash => trashed += 1,
+                    Op::Skip => skipped += 1,
+                },
+                ActionState::Failed => failed += 1,
+                ActionState::Pending | ActionState::Prepared | ActionState::Ambiguous => {}
+            }
+        }
+        let unresolved = item.unresolved_actions();
 
         let mut parts = Vec::new();
         if moved > 0 {
@@ -876,6 +902,9 @@ pub fn history(items: &[HistoryItem]) {
         if failed > 0 {
             parts.push(format!("{failed} failed"));
         }
+        if unresolved > 0 {
+            parts.push(format!("{unresolved} interrupted"));
+        }
         let breakdown = if parts.is_empty() {
             "no actions".to_string()
         } else {
@@ -892,13 +921,117 @@ pub fn history(items: &[HistoryItem]) {
             _ => String::new(),
         };
 
-        println!("  {}", item.id);
-        println!("  {}", format_timestamp(item.timestamp));
-        println!("  {kind} · {breakdown}{origin}");
-        println!();
+        let _ = writeln!(out, "  {}", item.id);
+        let _ = writeln!(out, "  {}", format_timestamp(item.timestamp));
+        let _ = writeln!(out, "  {kind} · {breakdown}{origin}");
+        match item.effective_state() {
+            // `effective_state` never yields `Running` (a durable `Running`
+            // journal is either completable or interrupted), so only the
+            // interrupted case needs a banner.
+            ExecutionState::Interrupted => {
+                let _ = writeln!(
+                    out,
+                    "  ⚠ incomplete — this execution did not finish; {unresolved} action(s) have no proven outcome."
+                );
+                let _ = writeln!(
+                    out,
+                    "    Review the paths above before retrying or undoing."
+                );
+            }
+            ExecutionState::Completed | ExecutionState::Running => {}
+        }
+        out.push('\n');
     }
-    println!("To undo one of these:");
-    println!("  sift undo <id>");
+    out.push_str("To undo one of these:\n");
+    out.push_str("  sift undo <id>\n");
+    out
+}
+
+// -------------------------------------------------- interrupted execution
+
+/// Explain a mid-execution failure unambiguously. Never says "Applied
+/// successfully", and distinguishes "nothing was changed" (initial journal
+/// failure) from "a change may have happened and is not recorded".
+///
+/// With `json`, stdout stays a valid JSON document (the machine-readable
+/// error) and the human explanation goes to stderr, so the error is never
+/// hidden from either audience.
+pub fn execution_interrupted(err: &ExecutionError, kind: &str, json: bool) {
+    if json {
+        eprintln!("{}", execution_interrupted_text(err, kind));
+        println!("{}", execution_interrupted_json(err, kind));
+    } else {
+        print!("{}", execution_interrupted_text(err, kind));
+    }
+}
+
+/// Machine-readable counterpart used with `--json --apply`, so the JSON
+/// stream is not polluted by human prose.
+fn execution_interrupted_json(err: &ExecutionError, kind: &str) -> String {
+    #[derive(serde::Serialize)]
+    struct ExecutionErrorJson<'a> {
+        ok: bool,
+        kind: &'a str,
+        failure: &'a str,
+        history_id: &'a Option<String>,
+        may_have_mutated: bool,
+        message: &'a str,
+    }
+    let failure = match err.failure {
+        ExecutionFailure::NotStarted => "not_started",
+        ExecutionFailure::Interrupted => "interrupted",
+    };
+    serde_json::to_string_pretty(&ExecutionErrorJson {
+        ok: false,
+        kind,
+        failure,
+        history_id: &err.history_id,
+        may_have_mutated: err.may_have_mutated,
+        message: &err.message,
+    })
+    .unwrap()
+}
+
+pub fn execution_interrupted_text(err: &ExecutionError, kind: &str) -> String {
+    use std::fmt::Write;
+    let color = use_color();
+    let mut out = String::new();
+    let _ = writeln!(out, "Sift {kind}");
+    out.push('\n');
+    match err.failure {
+        ExecutionFailure::NotStarted => {
+            let _ = writeln!(
+                out,
+                "{} Cannot start execution: the history store is unavailable.",
+                colorize("✗", "31", color)
+            );
+            let _ = writeln!(out, "  {}", err.message);
+            let _ = writeln!(out, "  No filesystem changes were made.");
+        }
+        ExecutionFailure::Interrupted => {
+            let _ = writeln!(out, "{} Execution interrupted.", colorize("⚠", "33", color));
+            let _ = writeln!(out, "  {}", err.message);
+            if err.may_have_mutated {
+                let _ = writeln!(
+                    out,
+                    "  A filesystem change may have been made and is not recorded as an outcome."
+                );
+            } else {
+                let _ = writeln!(out, "  No further filesystem changes were made.");
+            }
+            let _ = writeln!(out, "  No further actions were performed.");
+            if let Some(id) = &err.history_id {
+                out.push('\n');
+                let _ = writeln!(out, "History");
+                let _ = writeln!(out, "  {id}");
+                let _ = writeln!(
+                    out,
+                    "  Run `sift history` to inspect the recorded execution."
+                );
+            }
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------------ undo
@@ -921,12 +1054,38 @@ pub fn undo_parse_error(id: &str) {
     );
 }
 
-pub fn undo_result(id: &str, restored: usize, refused: &[ActionResult], trash_skipped: usize) {
+pub fn undo_reconcile_persist_error(id: &str, err: &str) {
+    println!("Sift undo {id}");
+    println!();
+    println!(
+        "{} Could not record the recovered execution state ({err}).",
+        colorize("⚠", "33", use_color())
+    );
+    println!("  Any action whose success is not already durable will not be undone.");
+}
+
+pub fn undo_record_error(err: &str) {
+    println!(
+        "{} The undo was performed, but its history record could not be written ({err}).",
+        colorize("⚠", "33", use_color())
+    );
+    println!("  The original history record is unchanged; re-check paths before retrying.");
+}
+
+pub fn undo_result(
+    id: &str,
+    restored: usize,
+    refused: &[ActionResult],
+    trash_skipped: usize,
+    unproven: usize,
+) {
     println!("Sift undo {id}");
     println!();
     let color = use_color();
-    if restored == 0 && refused.is_empty() && trash_skipped == 0 {
+    if restored == 0 && refused.is_empty() && trash_skipped == 0 && unproven == 0 {
         println!("Nothing to undo.");
+    } else if restored == 0 && refused.is_empty() {
+        println!("{} Nothing was restored.", colorize("•", "33", color));
     } else if refused.is_empty() {
         println!(
             "{} {restored} item{} restored",
@@ -951,6 +1110,15 @@ pub fn undo_result(id: &str, restored: usize, refused: &[ActionResult], trash_sk
                 println!("  {}  {e}", o.src.display());
             }
         }
+    }
+
+    if unproven > 0 {
+        println!();
+        println!(
+            "{unproven} item{} were not proven successful and were left untouched.",
+            plural(unproven)
+        );
+        println!("  Sift never undoes a pending, prepared, ambiguous or failed action.");
     }
 
     if trash_skipped > 0 {

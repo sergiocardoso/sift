@@ -9,6 +9,7 @@ pub mod fs;
 pub mod history;
 pub mod metadata;
 pub mod planner;
+pub mod recovery;
 pub mod render;
 pub mod scanner;
 pub mod update_check;

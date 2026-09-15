@@ -156,25 +156,40 @@ pub fn process_candidate(
     actions.push(entry_plan.action);
     let plan = Plan { actions };
 
-    let (id, outcomes) = executor::execute_plan(
+    // Watch goes through exactly the same write-ahead executor as the CLI:
+    // there is no weaker path. A journal failure of any kind stops this
+    // execution before it can mutate further, and is surfaced (never
+    // swallowed) via `failure` and the persisted `history_id`.
+    match executor::execute_plan(
         plan,
         watch_root.to_string_lossy().as_ref(),
         "organize",
         Some(watch_root),
-    );
-    let failure = outcomes
-        .iter()
-        .find(|o| o.result.is_err())
-        .and_then(|o| o.result.clone().err());
-    let organized = failure.is_none()
-        && outcomes
-            .iter()
-            .any(|o| o.op == Op::Move && o.result.is_ok());
-    ProcessOutcome {
-        organized,
-        skip_reason: None,
-        failure,
-        history_id: Some(id),
+    ) {
+        Ok(report) => {
+            let failure = report
+                .outcomes
+                .iter()
+                .find(|o| o.result.is_err())
+                .and_then(|o| o.result.clone().err());
+            let organized = failure.is_none()
+                && report
+                    .outcomes
+                    .iter()
+                    .any(|o| o.op == Op::Move && o.result.is_ok());
+            ProcessOutcome {
+                organized,
+                skip_reason: None,
+                failure,
+                history_id: Some(report.history_id),
+            }
+        }
+        Err(err) => ProcessOutcome {
+            organized: false,
+            skip_reason: None,
+            failure: Some(err.message.clone()),
+            history_id: err.history_id.clone(),
+        },
     }
 }
 

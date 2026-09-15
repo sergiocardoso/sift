@@ -755,10 +755,17 @@ pub fn cmd_folders(path: String, apply: bool, json: bool, remove_duplicates: boo
         return true;
     }
     let plan = combine_with_duplicate_removals(full_execution_plan(&fp), dup_actions);
-    let (hist_id, outcomes) = crate::executor::execute_plan(plan, &path, "folders", None);
-    let ok = !outcomes.iter().any(|o| o.result.is_err());
-    if !json {
-        crate::render::folders_apply_result(&outcomes, &hist_id);
+    match crate::executor::execute_plan(plan, &path, "folders", None) {
+        Ok(report) => {
+            let ok = !report.outcomes.iter().any(|o| o.result.is_err());
+            if !json {
+                crate::render::folders_apply_result(&report.outcomes, &report.history_id);
+            }
+            ok
+        }
+        Err(err) => {
+            crate::render::execution_interrupted(&err, "folders", json);
+            false
+        }
     }
-    ok
 }

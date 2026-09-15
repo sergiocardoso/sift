@@ -23,6 +23,21 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+/// Adapts the write-ahead executor's `Result` API back to a tuple for
+/// these pre-existing tests. A failed execution is a test bug here, so
+/// it panics with a clear message; journal-failure behavior is covered
+/// separately in the dedicated journal regression tests.
+fn exec_plan(
+    plan: sift::domain::Plan,
+    workdir: &str,
+    kind: &str,
+    watch_root: Option<&std::path::Path>,
+) -> (String, Vec<sift::domain::ActionResult>) {
+    let report = sift::executor::execute_plan(plan, workdir, kind, watch_root)
+        .expect("execute_plan should complete in these tests");
+    (report.history_id, report.outcomes)
+}
+
 /// Runs `f` with the watch registry isolated to a fresh temp directory,
 /// restoring the override afterward regardless of outcome.
 fn with_isolated_registry(f: impl FnOnce(&std::path::Path)) {
@@ -939,7 +954,7 @@ fn watched_toctou_collision_is_refused_and_recorded() {
     with_isolated_history(root, || {
         let mut actions = entry_plan.create_dirs;
         actions.push(entry_plan.action);
-        let (_id, outcomes) = sift::executor::execute_plan(
+        let (_id, outcomes) = exec_plan(
             sift::domain::Plan { actions },
             root.to_str().unwrap(),
             "organize",
@@ -1134,10 +1149,26 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn spawn(watch_dir: PathBuf, global_config_dir: PathBuf, history_dir: PathBuf) -> Self {
+        Self::spawn_with_fault(watch_dir, global_config_dir, history_dir, None)
+    }
+
+    /// Spawns the daemon and, before it starts, injects a journal-write
+    /// fault *inside the daemon's own thread* (the injection seam is
+    /// thread-local, so this is the only way to make the running daemon
+    /// itself fail a specific journal stage deterministically).
+    fn spawn_with_fault(
+        watch_dir: PathBuf,
+        global_config_dir: PathBuf,
+        history_dir: PathBuf,
+        fault: Option<(sift::history::JournalStage, usize)>,
+    ) -> Self {
         let handle = std::thread::spawn(move || {
             set_test_watch_dir(watch_dir);
             sift::config::set_test_global_config_dir(global_config_dir);
             sift::history::set_test_history_dir(history_dir);
+            if let Some((stage, skip)) = fault {
+                sift::history::inject_journal_fault(stage, skip);
+            }
             let _ = daemon::run();
         });
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1233,6 +1264,67 @@ fn cli_watch_start_is_not_racy_a_file_created_immediately_after_return_is_organi
         wait_for(&root.join("Images/photo.jpg"), Duration::from_secs(10)),
         "a file created immediately after a successful `watch start` must be organized"
     );
+
+    test_daemon.stop();
+    clear_test_watch_dir();
+    sift::config::clear_test_global_config_dir();
+    sift::history::clear_test_history_dir();
+}
+
+/// The running daemon itself (not just the engine) must honour the
+/// write-ahead contract: a journal-initialization failure means zero
+/// mutation, and the failure is recorded in the watch's health rather than
+/// swallowed.
+#[test]
+fn watched_journal_initialization_failure_mutates_nothing_and_is_recorded() {
+    let d = tempdir().unwrap();
+    let watch_dir = d.path().join(".sift-watch-test");
+    let global_dir = d.path().join(".sift-global-config-test");
+    fs::create_dir_all(&global_dir).unwrap();
+    let root = d.path().join("Inbox");
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let history_dir = root.join(".sift-history-test");
+
+    set_test_watch_dir(watch_dir.clone());
+    sift::config::set_test_global_config_dir(global_dir.clone());
+    sift::history::set_test_history_dir(history_dir.clone());
+
+    // Fail the very first (initial) journal write inside the daemon thread.
+    let test_daemon = TestDaemon::spawn_with_fault(
+        watch_dir.clone(),
+        global_dir.clone(),
+        history_dir.clone(),
+        Some((sift::history::JournalStage::Initial, 0)),
+    );
+
+    assert!(cmd_watch_add(
+        root.to_string_lossy().to_string(),
+        true,
+        false
+    ));
+    assert!(cmd_watch_start(root.to_string_lossy().to_string()));
+
+    let photo = root.join("photo.jpg");
+    fs::write(&photo, b"x").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut recorded = false;
+    while Instant::now() < deadline {
+        if let Ok(Some(entry)) = sift::watch::registry::find(&root) {
+            if entry.last_error.is_some() {
+                recorded = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(recorded, "the daemon must record the journal failure");
+    assert!(
+        photo.exists(),
+        "no mutation may happen when the journal cannot be initialized"
+    );
+    assert!(!root.join("Images/photo.jpg").exists());
 
     test_daemon.stop();
     clear_test_watch_dir();

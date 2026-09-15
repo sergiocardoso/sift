@@ -16,6 +16,21 @@ use std::fs::{self, File};
 use std::path::Path;
 use tempfile::tempdir;
 
+/// Adapts the write-ahead executor's `Result` API back to a tuple for
+/// these pre-existing tests. A failed execution is a test bug here, so
+/// it panics with a clear message; journal-failure behavior is covered
+/// separately in the dedicated journal regression tests.
+fn exec_plan(
+    plan: sift::domain::Plan,
+    workdir: &str,
+    kind: &str,
+    watch_root: Option<&std::path::Path>,
+) -> (String, Vec<sift::domain::ActionResult>) {
+    let report = sift::executor::execute_plan(plan, workdir, kind, watch_root)
+        .expect("execute_plan should complete in these tests");
+    (report.history_id, report.outcomes)
+}
+
 fn touch(p: &Path) {
     File::create(p).unwrap();
 }
@@ -652,8 +667,7 @@ fn test_apply_records_one_history_item_with_movedir() {
 
     let fp = plan_folders(t.to_str().unwrap());
     let plan = full_execution_plan(&fp);
-    let (hist_id, outcomes) =
-        sift::executor::execute_plan(plan, t.to_str().unwrap(), "folders", None);
+    let (hist_id, outcomes) = exec_plan(plan, t.to_str().unwrap(), "folders", None);
     assert!(outcomes
         .iter()
         .any(|o| o.op == Op::MoveDir && o.result.is_ok()));
@@ -684,7 +698,7 @@ fn test_undo_reverses_movedir() {
 
     let fp = plan_folders(t.to_str().unwrap());
     let plan = full_execution_plan(&fp);
-    let (hist_id, _) = sift::executor::execute_plan(plan, t.to_str().unwrap(), "folders", None);
+    let (hist_id, _) = exec_plan(plan, t.to_str().unwrap(), "folders", None);
     assert!(t.join("Documents").join("curriculo").is_dir());
 
     assert!(cmd_undo(hist_id));
@@ -707,7 +721,7 @@ fn test_undo_refuses_when_original_location_occupied() {
 
     let fp = plan_folders(t.to_str().unwrap());
     let plan = full_execution_plan(&fp);
-    let (hist_id, _) = sift::executor::execute_plan(plan, t.to_str().unwrap(), "folders", None);
+    let (hist_id, _) = exec_plan(plan, t.to_str().unwrap(), "folders", None);
     assert!(t.join("Documents").join("curriculo").is_dir());
 
     // Something now occupies the original location.
@@ -733,7 +747,7 @@ fn test_undo_refuses_when_destination_no_longer_a_directory() {
 
     let fp = plan_folders(t.to_str().unwrap());
     let plan = full_execution_plan(&fp);
-    let (hist_id, _) = sift::executor::execute_plan(plan, t.to_str().unwrap(), "folders", None);
+    let (hist_id, _) = exec_plan(plan, t.to_str().unwrap(), "folders", None);
     let moved = t.join("Documents").join("curriculo");
     assert!(moved.is_dir());
 
@@ -1085,8 +1099,7 @@ fn test_dedupe_removal_not_undoable() {
     let fp = plan_folders(t.to_str().unwrap());
     let (dup_actions, _) = plan_duplicate_removals(t, &fp.possible_duplicates, &fp.candidates);
     let plan = combine_with_duplicate_removals(full_execution_plan(&fp), dup_actions);
-    let (hist_id, outcomes) =
-        sift::executor::execute_plan(plan, t.to_str().unwrap(), "folders", None);
+    let (hist_id, outcomes) = exec_plan(plan, t.to_str().unwrap(), "folders", None);
     assert!(outcomes
         .iter()
         .any(|o| o.op == Op::Trash && o.result.is_ok() && !o.undoable));
@@ -1229,8 +1242,7 @@ fn test_realistic_smoke_fixture_end_to_end() {
 
     // --- apply ---
     let plan = full_execution_plan(&dry);
-    let (_hist_id, outcomes) =
-        sift::executor::execute_plan(plan, t.to_str().unwrap(), "folders", None);
+    let (_hist_id, outcomes) = exec_plan(plan, t.to_str().unwrap(), "folders", None);
     assert!(!outcomes.iter().any(|o| o.result.is_err()));
 
     assert!(t.join("3D").join("olho_grego").is_dir());

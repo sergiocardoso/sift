@@ -1895,12 +1895,24 @@ pub fn cmd_organize(path: String, apply: bool, json: bool, verbose: bool, recurs
         "organize"
     };
     let actions_for_render = plan.actions.clone();
-    let (hist_id, outcomes) = crate::executor::execute_plan(plan, &path, kind, None);
-    let ok = !outcomes.iter().any(|o| o.result.is_err());
-    if !json {
-        crate::render::organize_apply_result(&path, &actions_for_render, &outcomes, &hist_id);
+    match crate::executor::execute_plan(plan, &path, kind, None) {
+        Ok(report) => {
+            let ok = !report.outcomes.iter().any(|o| o.result.is_err());
+            if !json {
+                crate::render::organize_apply_result(
+                    &path,
+                    &actions_for_render,
+                    &report.outcomes,
+                    &report.history_id,
+                );
+            }
+            ok
+        }
+        Err(err) => {
+            crate::render::execution_interrupted(&err, kind, json);
+            false
+        }
     }
-    ok
 }
 
 pub fn cmd_clean(path: String, apply: bool, json: bool, verbose: bool) -> bool {
@@ -1925,10 +1937,22 @@ pub fn cmd_clean(path: String, apply: bool, json: bool, verbose: bool) -> bool {
         return true;
     }
     let actions_for_render = plan.actions.clone();
-    let (hist_id, outcomes) = crate::executor::execute_plan(plan, &path, "clean", None);
-    let ok = !outcomes.iter().any(|o| o.result.is_err());
-    if !json {
-        crate::render::clean_apply_result(&path, &actions_for_render, &outcomes, &hist_id);
+    match crate::executor::execute_plan(plan, &path, "clean", None) {
+        Ok(report) => {
+            let ok = !report.outcomes.iter().any(|o| o.result.is_err());
+            if !json {
+                crate::render::clean_apply_result(
+                    &path,
+                    &actions_for_render,
+                    &report.outcomes,
+                    &report.history_id,
+                );
+            }
+            ok
+        }
+        Err(err) => {
+            crate::render::execution_interrupted(&err, "clean", json);
+            false
+        }
     }
-    ok
 }

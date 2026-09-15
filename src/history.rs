@@ -2,7 +2,7 @@ use crate::domain::*;
 use directories::ProjectDirs;
 use std::cell::RefCell;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // A thread-local (not a process-global) override: cargo test runs each test
@@ -13,22 +13,87 @@ thread_local! {
     static TEST_HISTORY_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
+/// The point in the write-ahead lifecycle a journal write belongs to.
+/// Tags exist so tests can deterministically fail a *specific* stage
+/// (initial / prepare / outcome / finalize / reconcile) without touching
+/// the real disk or relying on timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalStage {
+    /// The journal's first write, before any mutation.
+    Initial,
+    /// The per-action write-ahead intent, before a mutation.
+    Prepare,
+    /// A terminal outcome (succeeded/failed) for one action.
+    Outcome,
+    /// The final `execution_state = completed` write.
+    Finalize,
+    /// Persisting a reconciliation result (used by `sift undo`).
+    Recover,
+    /// Persisting the separate record describing an undo attempt.
+    UndoRecord,
+}
+
+thread_local! {
+    // (stage, number of matching writes to let through before failing).
+    static JOURNAL_FAULT: RefCell<Option<(JournalStage, usize)>> = const { RefCell::new(None) };
+}
+
+/// Test-only: make the `(skip + 1)`-th journal write of `stage` fail.
+/// Thread-local, so parallel tests cannot interfere with each other.
+pub fn inject_journal_fault(stage: JournalStage, skip: usize) {
+    JOURNAL_FAULT.with(|cell| *cell.borrow_mut() = Some((stage, skip)));
+}
+
+/// Test-only: clear any injected journal fault for the current thread.
+pub fn clear_journal_fault() {
+    JOURNAL_FAULT.with(|cell| *cell.borrow_mut() = None);
+}
+
+fn journal_fault_triggered(stage: JournalStage) -> bool {
+    JOURNAL_FAULT.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match *slot {
+            Some((s, 0)) if s == stage => {
+                *slot = None;
+                true
+            }
+            Some((s, n)) if s == stage => {
+                *slot = Some((s, n - 1));
+                false
+            }
+            _ => false,
+        }
+    })
+}
+
 pub fn cmd_history() {
     let hist_dir = get_history_dir();
     let mut items = vec![];
+    let mut unreadable = 0usize;
     if let Ok(files) = fs::read_dir(&hist_dir) {
         for f in files.flatten() {
             let fp = f.path();
             if fp.extension().is_some_and(|e| e == "json") {
-                if let Ok(s) = fs::read_to_string(&fp) {
-                    if let Ok(item) = serde_json::from_str::<HistoryItem>(&s) {
-                        items.push(item);
-                    }
+                match fs::read_to_string(&fp)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| {
+                        serde_json::from_str::<HistoryItem>(&s).map_err(|e| e.to_string())
+                    }) {
+                    Ok(item) => items.push(item),
+                    Err(_) => unreadable += 1,
                 }
             }
         }
     }
     crate::render::history(&items);
+    if unreadable > 0 {
+        // Never let an unreadable record vanish silently: it might describe
+        // an interrupted execution that changed the filesystem.
+        eprintln!(
+            "history: {unreadable} record{} could not be read (corrupted or from a newer Sift); they are not shown.",
+            if unreadable == 1 { "" } else { "s" }
+        );
+    }
 }
 
 /// Dispatches to the type-specific undo for one successful, undoable
@@ -149,6 +214,13 @@ fn undo_move_dir(action: &Action) -> Option<ActionResult> {
 /// record is left untouched; a separate undo record is written describing
 /// what the undo attempt actually did. Returns `true` iff nothing was
 /// refused (used as the process exit code signal).
+///
+/// Before touching the filesystem this runs [`crate::recovery`] over the
+/// record. Reconciliation can *prove* that an interrupted `Prepared` move
+/// completed; when it does, the reconciled state is persisted **first**, so
+/// undo never acts on an in-memory guess. Only actions whose state is
+/// durably `Succeeded` are ever undone — never `Pending`, `Prepared`,
+/// `Ambiguous` or `Failed`.
 pub fn cmd_undo(id: String) -> bool {
     let hist_dir = get_history_dir();
     let fp = hist_dir.join(format!("{}.json", id));
@@ -159,22 +231,54 @@ pub fn cmd_undo(id: String) -> bool {
             return false;
         }
     };
-    let hist: HistoryItem = match serde_json::from_str(&data) {
+    let original: HistoryItem = match serde_json::from_str(&data) {
         Ok(h) => h,
         Err(_) => {
             crate::render::undo_parse_error(&id);
             return false;
         }
     };
+
+    // Reconcile in memory first. If it proves anything, the proof must be
+    // durable before we rely on it; a failed persist means we fall back to
+    // the on-disk states and simply don't undo the newly-proven actions.
+    let mut reconciled = original.clone();
+    let changed = crate::recovery::reconcile_item(&mut reconciled);
+    let hist = if changed {
+        match record_journal(&reconciled, JournalStage::Recover) {
+            Ok(()) => reconciled,
+            Err(e) => {
+                crate::render::undo_reconcile_persist_error(&id, &e);
+                original
+            }
+        }
+    } else {
+        reconciled
+    };
+
     let mut undo_outcomes: Vec<ActionResult> = Vec::new();
+    let mut unproven = 0usize;
     let mut trash_skipped = 0usize;
-    for (act, outcome) in hist.actions.iter().zip(hist.outcomes.iter()) {
+    for i in 0..hist.actions.len() {
+        let act = &hist.actions[i];
         if act.op == Op::Trash {
             trash_skipped += 1;
             continue;
         }
-        if let Some(result) = undo_one(act, outcome.result.is_ok()) {
-            undo_outcomes.push(result);
+        match hist.state_of(i) {
+            ActionState::Succeeded => {
+                if let Some(result) = undo_one(act, true) {
+                    undo_outcomes.push(result);
+                }
+            }
+            // Pending / Prepared / Ambiguous / Failed are unproven: undo
+            // must never touch them, and must say so rather than silently
+            // doing nothing.
+            _ => {
+                if matches!(act.op, Op::Move | Op::MoveDir) {
+                    unproven += 1;
+                }
+            }
         }
     }
     let restored = undo_outcomes.iter().filter(|o| o.result.is_ok()).count();
@@ -183,8 +287,8 @@ pub fn cmd_undo(id: String) -> bool {
         .filter(|o| o.result.is_err())
         .cloned()
         .collect();
-    let ok = refused.is_empty();
-    crate::render::undo_result(&id, restored, &refused, trash_skipped);
+    let mut ok = refused.is_empty();
+    crate::render::undo_result(&id, restored, &refused, trash_skipped, unproven);
 
     if !undo_outcomes.is_empty() {
         let undo_actions = undo_outcomes
@@ -197,6 +301,16 @@ pub fn cmd_undo(id: String) -> bool {
                 undoable: false,
             })
             .collect();
+        let undo_states = undo_outcomes
+            .iter()
+            .map(|o| {
+                if o.result.is_ok() {
+                    ActionState::Succeeded
+                } else {
+                    ActionState::Failed
+                }
+            })
+            .collect();
         let undo_item = HistoryItem {
             id: new_history_id(),
             actions: undo_actions,
@@ -205,24 +319,93 @@ pub fn cmd_undo(id: String) -> bool {
             kind: "undo".to_string(),
             origin: "manual".to_string(),
             watch_root: None,
+            execution_state: ExecutionState::Completed,
+            action_states: undo_states,
+            prepared_probe: None,
+            journal_version: JOURNAL_VERSION,
         };
-        if let Err(e) = record_history(&undo_item) {
-            eprintln!("history: failed to record undo: {}", e);
+        if let Err(e) = record_journal(&undo_item, JournalStage::UndoRecord) {
+            // The undo itself already happened on disk; its audit record is
+            // what failed. Surface it as a real error (visible output +
+            // failure exit code) rather than a bare stderr line.
+            crate::render::undo_record_error(&e);
+            ok = false;
         }
     }
     ok
 }
 
-/// Writes a history item to disk via a temp-file-then-rename, reporting
-/// errors instead of panicking.
+/// Test-only: the exact temp path `record_history` writes to before its
+/// atomic rename. Lets a test sabotage the temp write (e.g. by placing a
+/// directory there) to prove a failed update never corrupts the last good
+/// journal.
+#[doc(hidden)]
+pub fn history_temp_path(id: &str) -> PathBuf {
+    get_history_dir().join(temp_name(id))
+}
+
+fn temp_name(id: &str) -> String {
+    // PID-scoped so a stale temp left by a crashed process can never be
+    // mistaken for (or clobber) the in-progress write of a new one.
+    format!(".{}.{}.tmp", id, std::process::id())
+}
+
+/// Persist a history item atomically. Writes a sibling temp file, flushes
+/// it to stable storage, then `rename`s it over the destination — so a
+/// failed or partial write can never corrupt the previous valid journal.
 pub fn record_history(item: &HistoryItem) -> Result<(), String> {
+    write_journal_atomic(item)
+}
+
+/// Like [`record_history`], but tagged with the lifecycle [`JournalStage`]
+/// so tests can inject a deterministic failure at exactly that stage.
+pub fn record_journal(item: &HistoryItem, stage: JournalStage) -> Result<(), String> {
+    if journal_fault_triggered(stage) {
+        return Err(format!("injected journal write failure at {stage:?}"));
+    }
+    write_journal_atomic(item)
+}
+
+fn write_journal_atomic(item: &HistoryItem) -> Result<(), String> {
     let hist_dir = get_history_dir();
     fs::create_dir_all(&hist_dir).map_err(|e| format!("error creating history dir: {}", e))?;
     let fp = hist_dir.join(format!("{}.json", item.id));
-    let tmp = fp.with_extension("tmp");
+    let tmp = hist_dir.join(temp_name(&item.id));
     let s = serde_json::to_string_pretty(item).map_err(|e| format!("serialize error: {}", e))?;
-    fs::write(&tmp, &s).map_err(|e| format!("write error: {}", e))?;
-    fs::rename(&tmp, &fp).map_err(|e| format!("rename error: {}", e))
+
+    // Write + flush the temp file *before* the rename. `sync_all` is what
+    // turns "the OS has the bytes" into "stable storage has the bytes";
+    // the rename itself is then the atomic commit point. Any failure here
+    // removes the partial temp so a later writer never trips on it.
+    if let Err(e) = write_temp_file(&tmp, &s) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, &fp) {
+        // Leave no half-written temp behind for the next writer to trip on.
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("rename error: {}", e));
+    }
+    // Best-effort directory fsync so the rename itself survives power loss
+    // on filesystems that support it. Absent/failed on some platforms and
+    // filesystems; that only weakens the power-loss guarantee, never the
+    // process-crash guarantee. It cannot be made fail-closed portably:
+    // Windows cannot open a directory as a file at all, and after the
+    // rename the commit point has already passed, so returning `Err` here
+    // would misreport a journal that is actually in place.
+    if let Ok(dir) = fs::File::open(&hist_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+fn write_temp_file(tmp: &Path, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = fs::File::create(tmp).map_err(|e| format!("write error: {}", e))?;
+    f.write_all(contents.as_bytes())
+        .map_err(|e| format!("write error: {}", e))?;
+    f.sync_all().map_err(|e| format!("fsync error: {}", e))?;
+    Ok(())
 }
 
 fn now_secs() -> u64 {

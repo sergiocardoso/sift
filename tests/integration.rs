@@ -7,6 +7,21 @@ use sift::scanner::scan_entries;
 use std::fs::File;
 use tempfile::tempdir;
 
+/// Adapts the write-ahead executor's `Result` API back to a tuple for
+/// these pre-existing tests. A failed execution is a test bug here, so
+/// it panics with a clear message; journal-failure behavior is covered
+/// separately in the dedicated journal regression tests.
+fn exec_plan(
+    plan: sift::domain::Plan,
+    workdir: &str,
+    kind: &str,
+    watch_root: Option<&std::path::Path>,
+) -> (String, Vec<sift::domain::ActionResult>) {
+    let report = sift::executor::execute_plan(plan, workdir, kind, watch_root)
+        .expect("execute_plan should complete in these tests");
+    (report.history_id, report.outcomes)
+}
+
 #[test]
 fn test_extension_classification() {
     let db = CategoryDB::default();
@@ -175,7 +190,7 @@ fn test_apply_move_and_undo() {
         .any(|a| a.dst.as_ref() == Some(&dst) && matches!(a.op, Op::Move)));
     // Execute the full plan (including the CreateDir for Documents/) rather
     // than a hand-picked single action, since the Move depends on it.
-    sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(dst.exists());
     assert!(!src.exists());
     for h in std::fs::read_dir(hist_dir.clone()).unwrap().flatten() {
@@ -278,7 +293,6 @@ fn test_clean_dry_run_only_junk() {
 #[test]
 fn test_failed_move_recorded_accurately_in_history() {
     use sift::domain::HistoryItem;
-    use sift::executor::execute_plan;
     let d = tempdir().unwrap();
     let t = d.path();
     let hist_dir = t.join(".sift-history");
@@ -299,7 +313,7 @@ fn test_failed_move_recorded_accurately_in_history() {
     // rather than silently succeeding or crashing.
     std::fs::create_dir_all(t.join("Documents")).unwrap();
     File::create(t.join("Documents/race.txt")).unwrap();
-    execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(plan, t.to_str().unwrap(), "organize", None);
 
     assert!(
         src.exists(),
@@ -335,7 +349,6 @@ fn test_failed_move_recorded_accurately_in_history() {
 
 #[test]
 fn test_history_written() {
-    use sift::executor::execute_plan;
     let d = tempdir().unwrap();
     let t = d.path();
     let hist_dir = t.join(".sift-history");
@@ -355,7 +368,7 @@ fn test_history_written() {
         .actions
         .iter()
         .any(|a| a.dst.as_ref() == Some(&dst) && matches!(a.op, Op::Move)));
-    execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(plan, t.to_str().unwrap(), "organize", None);
     let found = std::fs::read_dir(hist_dir.clone())
         .unwrap()
         .flatten()
@@ -409,7 +422,6 @@ fn test_legacy_history_record_without_newer_fields_deserializes_and_undoes() {
 
 #[test]
 fn test_undo_refuses_occupied_original() {
-    use sift::executor::execute_plan;
     use sift::history::cmd_undo;
     let d = tempdir().unwrap();
     let t = d.path();
@@ -430,7 +442,7 @@ fn test_undo_refuses_occupied_original() {
         .actions
         .iter()
         .any(|a| a.dst.as_ref() == Some(&dst) && matches!(a.op, Op::Move)));
-    execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(plan, t.to_str().unwrap(), "organize", None);
     File::create(&src).unwrap();
     for h in std::fs::read_dir(hist_dir.clone()).unwrap().flatten() {
         let s = std::fs::read_to_string(h.path()).unwrap();
@@ -668,6 +680,10 @@ fn test_undo_ignores_unsuccessful_actions() {
         kind: "organize".into(),
         origin: "manual".into(),
         watch_root: None,
+        execution_state: sift::domain::ExecutionState::Completed,
+        action_states: vec![sift::domain::ActionState::Failed],
+        prepared_probe: None,
+        journal_version: 0,
     };
     record_history(&item).unwrap();
 
@@ -699,7 +715,7 @@ fn test_undo_does_not_rewrite_original_history_record() {
         &CategoryDB::default(),
         UnknownPolicy::Other,
     );
-    sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(dst.exists());
 
     let mut hist_file = None;
@@ -793,7 +809,6 @@ fn test_invalid_local_config_refuses_to_run_never_falls_back() {
 #[test]
 fn test_undo_refuses_when_destination_replaced_by_directory() {
     use sift::domain::HistoryItem;
-    use sift::executor::execute_plan;
     use sift::history::cmd_undo;
     let d = tempdir().unwrap();
     let t = d.path();
@@ -814,7 +829,7 @@ fn test_undo_refuses_when_destination_replaced_by_directory() {
         .actions
         .iter()
         .any(|a| a.dst.as_ref() == Some(&dst) && matches!(a.op, Op::Move)));
-    execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(dst.exists());
     assert!(!src.exists());
 
@@ -934,7 +949,7 @@ fn test_config_move_destination_symlink_escape_rejected() {
         reason: Some("hand-crafted TOCTOU attempt".into()),
         undoable: false,
     };
-    sift::executor::execute_plan(
+    exec_plan(
         sift::domain::Plan {
             actions: vec![escape_move, escape_mkdir],
         },
@@ -1063,7 +1078,6 @@ fn test_recursive_organize_dry_run_no_mutation() {
 
 #[test]
 fn test_recursive_organize_apply_moves_nested_files() {
-    use sift::executor::execute_plan;
     use sift::planner::plan_organize_recursive;
     let d = tempdir().unwrap();
     let t = d.path();
@@ -1081,7 +1095,7 @@ fn test_recursive_organize_apply_moves_nested_files() {
         &CategoryDB::default(),
         UnknownPolicy::Other,
     );
-    let (_id, outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
+    let (_id, outcomes) = exec_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
     assert!(outcomes.iter().all(|o| o.result.is_ok()));
 
     assert!(t.join("Documents/root.pdf").exists());
@@ -1331,7 +1345,6 @@ fn test_recursive_organize_broken_symlink_collision_in_nested_dir() {
 #[test]
 fn test_recursive_executor_toctou_collision_in_nested_dir() {
     use sift::domain::HistoryItem;
-    use sift::executor::execute_plan;
     use sift::planner::plan_organize_recursive;
     let d = tempdir().unwrap();
     let t = d.path();
@@ -1353,7 +1366,7 @@ fn test_recursive_executor_toctou_collision_in_nested_dir() {
     std::fs::create_dir_all(t.join("nested/Documents")).unwrap();
     File::create(t.join("nested/Documents/race.txt")).unwrap();
 
-    let (_id, outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
+    let (_id, outcomes) = exec_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
     assert!(
         src.exists(),
         "a failed move must leave the source untouched"
@@ -1385,7 +1398,6 @@ fn test_duplicate_trash_toctou_refused_when_no_longer_identical() {
     // `dst` changed in between (or vanished), it's no longer safe to
     // assume the source is redundant, so execution must refuse rather than
     // trash it anyway.
-    use sift::executor::execute_plan;
     let d = tempdir().unwrap();
     let t = d.path();
     File::create(t.join("foo.pdf")).unwrap();
@@ -1408,7 +1420,7 @@ fn test_duplicate_trash_toctou_refused_when_no_longer_identical() {
     // Race: the "duplicate" changes after planning but before execution.
     std::fs::write(t.join("Documents/foo.pdf"), b"no longer identical").unwrap();
 
-    let (_id, outcomes) = execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    let (_id, outcomes) = exec_plan(plan, t.to_str().unwrap(), "organize", None);
     let trash_outcome = outcomes.iter().find(|o| o.op == Op::Trash).unwrap();
     assert!(
         trash_outcome.result.is_err(),
@@ -1440,7 +1452,7 @@ fn test_recursive_executor_refuses_symlink_ancestor_escape() {
     };
     let hist_dir = t.join(".sift-history");
     set_test_history_dir(hist_dir.clone());
-    sift::executor::execute_plan(
+    exec_plan(
         sift::domain::Plan {
             actions: vec![escape_move],
         },
@@ -1455,7 +1467,6 @@ fn test_recursive_executor_refuses_symlink_ancestor_escape() {
 
 #[test]
 fn test_recursive_history_records_one_operation() {
-    use sift::executor::execute_plan;
     use sift::planner::plan_organize_recursive;
     let d = tempdir().unwrap();
     let t = d.path();
@@ -1473,7 +1484,7 @@ fn test_recursive_history_records_one_operation() {
         &CategoryDB::default(),
         UnknownPolicy::Other,
     );
-    let (id, _outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
+    let (id, _outcomes) = exec_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
 
     let files: Vec<_> = std::fs::read_dir(&hist_dir).unwrap().flatten().collect();
     assert_eq!(
@@ -1490,7 +1501,6 @@ fn test_recursive_history_records_one_operation() {
 
 #[test]
 fn test_recursive_undo_restores_nested_files() {
-    use sift::executor::execute_plan;
     use sift::history::cmd_undo;
     use sift::planner::plan_organize_recursive;
     let d = tempdir().unwrap();
@@ -1509,7 +1519,7 @@ fn test_recursive_undo_restores_nested_files() {
         &CategoryDB::default(),
         UnknownPolicy::Other,
     );
-    let (id, _outcomes) = execute_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
+    let (id, _outcomes) = exec_plan(rp.plan, t.to_str().unwrap(), "organize-recursive", None);
     assert!(t.join("Documents/root.pdf").exists());
     assert!(t.join("nested/Images/nested.jpg").exists());
 
@@ -1940,7 +1950,6 @@ fn test_recursive_new_category_dirs_are_terminal() {
 
 #[test]
 fn test_organize_second_run_is_idempotent() {
-    use sift::executor::execute_plan;
     use sift::planner::plan_organize_recursive;
     let d = tempdir().unwrap();
     let t = d.path();
@@ -1959,7 +1968,7 @@ fn test_organize_second_run_is_idempotent() {
         &CategoryDB::default(),
         UnknownPolicy::Other,
     );
-    execute_plan(rp1.plan, t.to_str().unwrap(), "organize-recursive", None);
+    exec_plan(rp1.plan, t.to_str().unwrap(), "organize-recursive", None);
 
     // Run again on the now-organized tree.
     let rp2 = plan_organize_recursive(
@@ -1982,7 +1991,6 @@ fn test_organize_second_run_is_idempotent() {
 #[test]
 fn test_executor_toctou_protection_applies_to_other_category() {
     use sift::domain::HistoryItem;
-    use sift::executor::execute_plan;
     let d = tempdir().unwrap();
     let t = d.path();
     let hist_dir = t.join(".sift-history");
@@ -2006,7 +2014,7 @@ fn test_executor_toctou_protection_applies_to_other_category() {
     std::fs::create_dir_all(t.join("Other")).unwrap();
     File::create(t.join("Other/race.xyz")).unwrap();
 
-    execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(
         src.exists(),
         "a failed move must leave the source untouched"
@@ -2063,7 +2071,6 @@ fn test_dry_run_zero_mutation_for_new_categories() {
 
 #[test]
 fn test_undo_restores_files_moved_into_new_categories() {
-    use sift::executor::execute_plan;
     use sift::history::cmd_undo;
     let d = tempdir().unwrap();
     let t = d.path();
@@ -2081,7 +2088,7 @@ fn test_undo_restores_files_moved_into_new_categories() {
         &CategoryDB::default(),
         UnknownPolicy::Other,
     );
-    let (id, _outcomes) = execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    let (id, _outcomes) = exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(t.join("Code/codigo.js").exists());
     assert!(t.join("Data/data.json").exists());
     assert!(t.join("Other/mystery.xyz").exists());

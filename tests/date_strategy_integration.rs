@@ -22,6 +22,21 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 
+/// Adapts the write-ahead executor's `Result` API back to a tuple for
+/// these pre-existing tests. A failed execution is a test bug here, so
+/// it panics with a clear message; journal-failure behavior is covered
+/// separately in the dedicated journal regression tests.
+fn exec_plan(
+    plan: sift::domain::Plan,
+    workdir: &str,
+    kind: &str,
+    watch_root: Option<&std::path::Path>,
+) -> (String, Vec<sift::domain::ActionResult>) {
+    let report = sift::executor::execute_plan(plan, workdir, kind, watch_root)
+        .expect("execute_plan should complete in these tests");
+    (report.history_id, report.outcomes)
+}
+
 // ------------------------------------------------------------- fixtures
 
 /// Exact inverse of `utils::civil_from_unix_secs` (the well-known
@@ -438,7 +453,7 @@ fn date_apply_renames_on_different_content_never_overwrites() {
         &policy,
         &sift::classifier::CategoryDB::default(),
     );
-    sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert_eq!(
         fs::read_to_string(t.join("2026/09/invoice.pdf")).unwrap(),
         "existing",
@@ -720,7 +735,7 @@ fn recursive_date_apply_works() {
         &policy,
         &sift::classifier::CategoryDB::default(),
     );
-    sift::executor::execute_plan(rp.plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(rp.plan, t.to_str().unwrap(), "organize", None);
     assert!(t.join("2026/09/one.pdf").exists());
     assert!(t.join("Client/2026/09/two.pdf").exists());
     sift::history::clear_test_history_dir();
@@ -786,7 +801,7 @@ fn second_date_run_is_idempotent() {
         &policy,
         &sift::classifier::CategoryDB::default(),
     );
-    sift::executor::execute_plan(rp1.plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(rp1.plan, t.to_str().unwrap(), "organize", None);
     assert!(t.join("2026/09/one.pdf").exists());
 
     let rp2 = plan_with_strategy_recursive(
@@ -794,7 +809,7 @@ fn second_date_run_is_idempotent() {
         &policy,
         &sift::classifier::CategoryDB::default(),
     );
-    sift::executor::execute_plan(rp2.plan, t.to_str().unwrap(), "organize", None);
+    exec_plan(rp2.plan, t.to_str().unwrap(), "organize", None);
     assert!(
         !t.join("2026/09/2026").exists(),
         "second run must never nest 2026/09/2026/09"
@@ -1226,7 +1241,7 @@ fn toctou_destination_collision_refused() {
 
     let hist_dir = t.join(".sift-history-test");
     sift::history::set_test_history_dir(hist_dir);
-    let (_id, outcomes) = sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    let (_id, outcomes) = exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(outcomes
         .iter()
         .any(|o| o.op == Op::Move && o.result.is_err()));
@@ -1257,7 +1272,7 @@ fn destination_ancestor_symlink_introduced_after_planning_refused() {
 
     let hist_dir = t.join(".sift-history-test");
     sift::history::set_test_history_dir(hist_dir);
-    let (_id, outcomes) = sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    let (_id, outcomes) = exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(outcomes.iter().any(|o| o.result.is_err()));
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     assert!(t.join("invoice.pdf").exists());
@@ -1282,7 +1297,7 @@ fn source_type_changed_before_execution_refused() {
 
     let hist_dir = t.join(".sift-history-test");
     sift::history::set_test_history_dir(hist_dir);
-    let (_id, outcomes) = sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    let (_id, outcomes) = exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(outcomes
         .iter()
         .any(|o| o.op == Op::Move && o.result.is_err()));
@@ -1305,7 +1320,7 @@ fn successful_date_move_recorded_in_history() {
         &policy,
         &sift::classifier::CategoryDB::default(),
     );
-    let (id, outcomes) = sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    let (id, outcomes) = exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(outcomes
         .iter()
         .any(|o| o.op == Op::Move && o.result.is_ok()));
@@ -1326,7 +1341,7 @@ fn undo_safely_restores_date_organized_file() {
         &policy,
         &sift::classifier::CategoryDB::default(),
     );
-    let (id, _) = sift::executor::execute_plan(plan, t.to_str().unwrap(), "organize", None);
+    let (id, _) = exec_plan(plan, t.to_str().unwrap(), "organize", None);
     assert!(t.join("2026/09/invoice.pdf").exists());
 
     assert!(sift::history::cmd_undo(id));

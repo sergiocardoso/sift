@@ -412,6 +412,26 @@ Undo is intentionally defensive. Before restoring a file, Sift verifies that:
 
 If the live filesystem no longer matches those assumptions, Sift refuses the unsafe undo.
 
+### Write-ahead history
+
+Sift records execution intent before it changes anything on disk. Before the
+first file of an applied plan is touched, it writes an execution record
+containing the whole plan; before each individual action it records that
+action's intent; only then does the filesystem mutation run, and its outcome
+is recorded immediately after.
+
+The practical guarantees are:
+
+- if the history store cannot be initialized, **no filesystem change is made**;
+- an execution interrupted partway leaves a visible, incomplete record in
+  `sift history` rather than being silently treated as completed;
+- `sift undo` only ever reverses actions whose success is proven and recorded
+  — never a pending, prepared, ambiguous or failed action.
+
+This is crash-consistency for the history record, not a full filesystem
+transaction, and it does not make trash undoable: `sift undo` never restores
+files from the system trash.
+
 ---
 
 # Different folders, different rules
@@ -1215,7 +1235,9 @@ The scanner does not mutate the filesystem.
 
 The planner decides what should happen.
 
-The executor applies only explicitly authorized plans and revalidates safety assumptions immediately before mutation.
+The executor applies only explicitly authorized plans, records each action's
+intent to history *before* mutating, and revalidates safety assumptions
+immediately before mutation.
 
 Watch reuses the same organization authority instead of implementing a separate, weaker organizer.
 
