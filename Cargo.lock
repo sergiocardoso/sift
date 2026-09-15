@@ -2713,7 +2713,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sift"
-version = "0.7.13"
+version = "0.7.14"
 dependencies = [
  "clap",
  "directories",
@@ -2735,7 +2735,7 @@ dependencies = [
 
 [[package]]
 name = "sift-tray"
-version = "0.7.13"
+version = "0.7.14"
 dependencies = [
  "image",
  "notify-rust",
